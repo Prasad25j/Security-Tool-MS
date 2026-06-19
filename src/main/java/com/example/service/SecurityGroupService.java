@@ -10,10 +10,18 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -807,6 +815,11 @@ public class SecurityGroupService {
         String groupName = incoming.getGroupName();
         boolean isNewGroup = (guid == null || guid.trim().isEmpty());
 
+        // Restrict modifying the IT ADMIN group
+        if (groupName != null && groupName.trim().equalsIgnoreCase("IT ADMIN")) {
+            throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+        }
+
         // Step A — Read existing state
         SecurityGroupDto existing;
         if (isNewGroup) {
@@ -816,10 +829,17 @@ public class SecurityGroupService {
             existing = new SecurityGroupDto(guid, groupName);
         } else {
             existing = getSecurityConfiguration(guid);
+            if (existing != null && existing.getGroupName() != null && existing.getGroupName().trim().equalsIgnoreCase("IT ADMIN")) {
+                throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+            }
         }
 
         // Step B & C — Compare and generate SQL
         List<String> scripts = new ArrayList<>();
+        Map<String, String> authGuidMap = new java.util.HashMap<>();
+        if (!isNewGroup) {
+            loadExistingAuthGuids(guid, authGuidMap);
+        }
 
         // ── Security Group INSERT if new ────────────────────────────────
         if (isNewGroup) {
@@ -1009,6 +1029,7 @@ public class SecurityGroupService {
         diff(incomingCompanyKeys, existingCompanyKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
             scripts.add(String.format(
                 "INSERT INTO ASAUTHCOMPANY (AUTHCOMPANYGUID, COMPANYGUID, SECURITYGROUPGUID) VALUES ('%s', '%s', '%s');",
                 esc(newGuid), esc(p[1]), esc(p[0])));
@@ -1017,121 +1038,277 @@ public class SecurityGroupService {
         diff(incomingCompanyPageKeys, existingCompanyPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHCOMPANYPAGE (AUTHCOMPANYPAGEGUID, AUTHCOMPANYGUID, AUTHPAGEGUID) SELECT '%s', AUTHCOMPANYGUID, '%s' FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(newGuid), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHCOMPANYPAGE (AUTHCOMPANYPAGEGUID, AUTHCOMPANYGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[2])));
         });
         // Company page buttons
         diff(incomingCompanyPageButtonKeys, existingCompanyPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHCOMPANYPAGEBUTTON (AUTHCOMPANYPAGEBUTTONGUID, AUTHCOMPANYPAGEGUID, AUTHBUTTONGUID) SELECT '%s', AUTHCOMPANYPAGEGUID, '%s' FROM ASAUTHCOMPANYPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHCOMPANYPAGEBUTTON (AUTHCOMPANYPAGEBUTTONGUID, AUTHCOMPANYPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
         // Company inquiries
         diff(incomingCompanyInquiryKeys, existingCompanyInquiryKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            String parentKey = p[0] + "|" + p[1];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHCOMPANYINQUIRY (AUTHCOMPANYINQUIRYGUID, AUTHCOMPANYGUID, INQUIRYSCREENNAMEGUID) SELECT '%s', AUTHCOMPANYGUID, '%s' FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(newGuid), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHCOMPANYINQUIRY (AUTHCOMPANYINQUIRYGUID, AUTHCOMPANYGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[2])));
         });
         // Company web services
         diff(incomingCompanyWebServiceKeys, existingCompanyWebServiceKeys).forEach(k -> {
             String[] p = k.split("\\|");
+            String parentKey = p[0] + "|" + p[1];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHCOMPANYWEBSERVICE (AUTHWEBSERVICEGUID, AUTHCOMPANYGUID) SELECT '%s', AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHCOMPANYWEBSERVICE (AUTHWEBSERVICEGUID, AUTHCOMPANYGUID) VALUES ('%s', '%s');",
+                esc(p[2]), esc(parentAuthGuid)));
         });
         // Plans
         diff(incomingPlanKeys, existingPlanKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPLAN (AUTHPLANGUID, AUTHCOMPANYGUID, PLANGUID) SELECT '%s', AUTHCOMPANYGUID, '%s' FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(newGuid), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPLAN (AUTHPLANGUID, AUTHCOMPANYGUID, PLANGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[2])));
         });
         // Plan pages
         diff(incomingPlanPageKeys, existingPlanPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPLANPAGE (AUTHPLANPAGEGUID, AUTHPLANGUID, AUTHPAGEGUID) SELECT '%s', AUTHPLANGUID, '%s' FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPLANPAGE (AUTHPLANPAGEGUID, AUTHPLANGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
         // Plan page buttons
         diff(incomingPlanPageButtonKeys, existingPlanPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPLANPAGEBUTTON (AUTHPLANPAGEGUID, AUTHBUTTONGUID) SELECT AUTHPLANPAGEGUID, '%s' FROM ASAUTHPLANPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPLANPAGEBUTTON (AUTHPLANPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                esc(parentAuthGuid), esc(p[4])));
         });
         // Plan transactions
         diff(incomingTransactionKeys, existingTransactionKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHTRANSACTION (AUTHTRANSACTIONGUID, AUTHPLANGUID, TRANSACTIONGUID) SELECT '%s', AUTHPLANGUID, '%s' FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHTRANSACTION (AUTHTRANSACTIONGUID, AUTHPLANGUID, TRANSACTIONGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
         // Plan inquiries
         diff(incomingPlanInquiryKeys, existingPlanInquiryKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPLANINQUIRY (AUTHPLANINQUIRYGUID, AUTHPLANGUID, INQUIRYSCREENNAMEGUID) SELECT '%s', AUTHPLANGUID, '%s' FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPLANINQUIRY (AUTHPLANINQUIRYGUID, AUTHPLANGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
         // Products
         diff(incomingProductKeys, existingProductKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPRODUCT (AUTHPRODUCTGUID, AUTHCOMPANYGUID, PRODUCTGUID) SELECT '%s', AUTHCOMPANYGUID, '%s' FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(newGuid), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPRODUCT (AUTHPRODUCTGUID, AUTHCOMPANYGUID, PRODUCTGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[2])));
         });
         // Product pages
         diff(incomingProductPageKeys, existingProductPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPRODUCTPAGE (AUTHPRODUCTPAGEGUID, AUTHPRODUCTGUID, AUTHPAGEGUID) SELECT '%s', AUTHPRODUCTGUID, '%s' FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPRODUCTPAGE (AUTHPRODUCTPAGEGUID, AUTHPRODUCTGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
         // Product page buttons
         diff(incomingProductPageButtonKeys, existingProductPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPRODUCTPAGEBUTTON (AUTHPRODUCTPAGEGUID, AUTHBUTTONGUID) SELECT AUTHPRODUCTPAGEGUID, '%s' FROM ASAUTHPRODUCTPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPRODUCTPAGEBUTTON (AUTHPRODUCTPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                esc(parentAuthGuid), esc(p[4])));
         });
         // Product transactions
         diff(incomingProductTransactionKeys, existingProductTransactionKeys).forEach(k -> {
             String[] p = k.split("\\|");
             String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            authGuidMap.put(k, newGuid);
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPRODUCTTRANSACTION (AUTHPRODUCTTRANSACTIONGUID, AUTHPRODUCTGUID, TRANSACTIONGUID) SELECT '%s', AUTHPRODUCTGUID, '%s' FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(newGuid), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPRODUCTTRANSACTION (AUTHPRODUCTTRANSACTIONGUID, AUTHPRODUCTGUID, TRANSACTIONGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
         });
-
         // Product transaction buttons
         diff(incomingProductTransactionButtonKeys, existingProductTransactionButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHPRODUCTTRANSACTIONBUTTON (AUTHPRODUCTTRANSACTIONGUID, AUTHBUTTONGUID) SELECT AUTHPRODUCTTRANSACTIONGUID, '%s' FROM ASAUTHPRODUCTTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHPRODUCTTRANSACTIONBUTTON (AUTHPRODUCTTRANSACTIONGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                esc(parentAuthGuid), esc(p[4])));
         });
-
         // Plan transaction buttons
         diff(incomingTransactionButtonKeys, existingTransactionButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
             scripts.add(String.format(
-                "INSERT INTO ASAUTHTRANSACTIONBUTTON (AUTHTRANSACTIONGUID, AUTHBUTTONGUID) SELECT AUTHTRANSACTIONGUID, '%s' FROM ASAUTHTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+                "INSERT INTO ASAUTHTRANSACTIONBUTTON (AUTHTRANSACTIONGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                esc(parentAuthGuid), esc(p[4])));
         });
 
         return new GenerateScriptsResponseDto(guid, groupName, scripts);
+    }
+
+    private void loadExistingAuthGuids(String securityGroupGuid, Map<String, String> authGuidMap) {
+        JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+        
+        // 1. Companies
+        jdbc.query(
+            "SELECT AUTHCOMPANYGUID, COMPANYGUID FROM ASAUTHCOMPANY WHERE SECURITYGROUPGUID = ?",
+            rs -> {
+                String authGuid = rs.getString("AUTHCOMPANYGUID");
+                String companyGuid = rs.getString("COMPANYGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (companyGuid != null ? companyGuid.trim() : ""), authGuid != null ? authGuid.trim() : "");
+            },
+            securityGroupGuid
+        );
+        
+        // 2. Company Pages
+        jdbc.query(
+            "SELECT cp.AUTHCOMPANYPAGEGUID, c.COMPANYGUID, cp.AUTHPAGEGUID " +
+            "FROM ASAUTHCOMPANYPAGE cp " +
+            "JOIN ASAUTHCOMPANY c ON cp.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String pg = rs.getString("AUTHPAGEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (pg != null ? pg.trim() : ""), rs.getString("AUTHCOMPANYPAGEGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 3. Plans
+        jdbc.query(
+            "SELECT p.AUTHPLANGUID, c.COMPANYGUID, p.PLANGUID " +
+            "FROM ASAUTHPLAN p " +
+            "JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String plan = rs.getString("PLANGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (plan != null ? plan.trim() : ""), rs.getString("AUTHPLANGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 4. Plan Pages
+        jdbc.query(
+            "SELECT pp.AUTHPLANPAGEGUID, c.COMPANYGUID, p.PLANGUID, pp.AUTHPAGEGUID " +
+            "FROM ASAUTHPLANPAGE pp " +
+            "JOIN ASAUTHPLAN p ON pp.AUTHPLANGUID = p.AUTHPLANGUID " +
+            "JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String plan = rs.getString("PLANGUID");
+                String pg = rs.getString("AUTHPAGEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (plan != null ? plan.trim() : "") + "|" + (pg != null ? pg.trim() : ""), rs.getString("AUTHPLANPAGEGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 5. Transactions
+        jdbc.query(
+            "SELECT t.AUTHTRANSACTIONGUID, c.COMPANYGUID, p.PLANGUID, t.TRANSACTIONGUID " +
+            "FROM ASAUTHTRANSACTION t " +
+            "JOIN ASAUTHPLAN p ON t.AUTHPLANGUID = p.AUTHPLANGUID " +
+            "JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String plan = rs.getString("PLANGUID");
+                String txn = rs.getString("TRANSACTIONGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (plan != null ? plan.trim() : "") + "|" + (txn != null ? txn.trim() : ""), rs.getString("AUTHTRANSACTIONGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 6. Products
+        jdbc.query(
+            "SELECT pr.AUTHPRODUCTGUID, c.COMPANYGUID, pr.PRODUCTGUID " +
+            "FROM ASAUTHPRODUCT pr " +
+            "JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String prod = rs.getString("PRODUCTGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (prod != null ? prod.trim() : ""), rs.getString("AUTHPRODUCTGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 7. Product Pages
+        jdbc.query(
+            "SELECT pp.AUTHPRODUCTPAGEGUID, c.COMPANYGUID, pr.PRODUCTGUID, pp.AUTHPAGEGUID " +
+            "FROM ASAUTHPRODUCTPAGE pp " +
+            "JOIN ASAUTHPRODUCT pr ON pp.AUTHPRODUCTGUID = pr.AUTHPRODUCTGUID " +
+            "JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String prod = rs.getString("PRODUCTGUID");
+                String pg = rs.getString("AUTHPAGEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (prod != null ? prod.trim() : "") + "|" + (pg != null ? pg.trim() : ""), rs.getString("AUTHPRODUCTPAGEGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 8. Product Transactions
+        jdbc.query(
+            "SELECT pt.AUTHPRODUCTTRANSACTIONGUID, c.COMPANYGUID, pr.PRODUCTGUID, pt.TRANSACTIONGUID " +
+            "FROM ASAUTHPRODUCTTRANSACTION pt " +
+            "JOIN ASAUTHPRODUCT pr ON pt.AUTHPRODUCTGUID = pr.AUTHPRODUCTGUID " +
+            "JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String prod = rs.getString("PRODUCTGUID");
+                String txn = rs.getString("TRANSACTIONGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (prod != null ? prod.trim() : "") + "|" + (txn != null ? txn.trim() : ""), rs.getString("AUTHPRODUCTTRANSACTIONGUID"));
+            },
+            securityGroupGuid
+        );
     }
 
     // ===================================================================
@@ -1363,55 +1540,259 @@ public class SecurityGroupService {
         return a.stream().filter(k -> !b.contains(k)).collect(Collectors.toList());
     }
 
+    public static class ParameterizedSql {
+        public final String sql;
+        public final Object[] args;
+        public ParameterizedSql(String sql, Object[] args) {
+            this.sql = sql;
+            this.args = args;
+        }
+    }
+
+    private ParameterizedSql parameterize(String sql) {
+        StringBuilder template = new StringBuilder();
+        List<Object> args = new ArrayList<>();
+        int len = sql.length();
+        boolean inQuotes = false;
+        StringBuilder currentVal = null;
+        for (int i = 0; i < len; i++) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                if (inQuotes) {
+                    // Check if it's an escaped single quote (two single quotes in a row)
+                    if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                        currentVal.append('\'');
+                        i++; // Skip the second quote
+                    } else {
+                        inQuotes = false;
+                        args.add(currentVal.toString());
+                        template.append('?');
+                    }
+                } else {
+                    inQuotes = true;
+                    currentVal = new StringBuilder();
+                }
+            } else {
+                if (inQuotes) {
+                    currentVal.append(c);
+                } else {
+                    template.append(c);
+                }
+            }
+        }
+        String tSql = template.toString().trim();
+        if (tSql.endsWith(";")) {
+            tSql = tSql.substring(0, tSql.length() - 1).trim();
+        }
+        return new ParameterizedSql(tSql, args.toArray());
+    }
+
+
     /** Execute generated delta SQL scripts on secondaryDev database. */
     @Transactional(value = "secondaryDevTransactionManager")
     public void executeScripts(List<String> scripts) {
         if (scripts == null || scripts.isEmpty()) {
             return;
         }
-        JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
-        List<String> batch = new ArrayList<>();
-        int batchSize = 200;
-        int batchCount = 0;
-        int totalExecuted = 0;
-        System.out.println("Starting execution of " + scripts.size() + " scripts with batch size " + batchSize);
-        long startTime = System.currentTimeMillis();
+        
+        List<String> deleteScripts = new ArrayList<>();
+        List<String> insertScripts = new ArrayList<>();
         for (String script : scripts) {
             if (script == null) continue;
             String trimmed = script.trim();
-            // Skip comments and empty lines
             if (trimmed.isEmpty() || trimmed.startsWith("--")) {
                 continue;
             }
-            // Strip trailing semicolon if present
-            if (trimmed.endsWith(";")) {
-                trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+            if (trimmed.toUpperCase().startsWith("DELETE")) {
+                deleteScripts.add(trimmed);
+            } else {
+                insertScripts.add(trimmed);
             }
-            if (!trimmed.isEmpty()) {
-                batch.add(trimmed);
-                if (batch.size() >= batchSize) {
-                    batchCount++;
-                    totalExecuted += batch.size();
-                    System.out.println("Executing batch #" + batchCount + " (" + batch.size() + " statements, total executed: " + totalExecuted + ")...");
-                    long startBatch = System.currentTimeMillis();
-                    jdbc.batchUpdate(batch.toArray(new String[0]));
-                    long endBatch = System.currentTimeMillis();
-                    System.out.println("Batch #" + batchCount + " executed in " + (endBatch - startBatch) + " ms.");
-                    batch.clear();
+        }
+        
+        Map<String, List<Object[]>> batchedInserts = new java.util.LinkedHashMap<>();
+        for (String script : insertScripts) {
+            ParameterizedSql paramSql = parameterize(script);
+            List<Object[]> argsList = batchedInserts.computeIfAbsent(paramSql.sql, k -> new ArrayList<>());
+            argsList.add(paramSql.args);
+        }
+        
+        Map<Integer, Map<String, List<Object[]>>> levelsMap = new java.util.TreeMap<>();
+        for (Map.Entry<String, List<Object[]>> entry : batchedInserts.entrySet()) {
+            String sql = entry.getKey();
+            List<Object[]> argsList = entry.getValue();
+            int level = getInsertLevel(sql);
+            levelsMap.computeIfAbsent(level, k -> new java.util.LinkedHashMap<>()).put(sql, argsList);
+        }
+        
+        int numConnections = 24;
+        ExecutorService executor = Executors.newFixedThreadPool(numConnections);
+        List<Connection> conns = new ArrayList<>();
+        Set<Connection> usedConnections = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+        
+        try {
+            List<Future<Connection>> connFutures = new ArrayList<>();
+            for (int i = 0; i < numConnections; i++) {
+                connFutures.add(executor.submit(() -> {
+                    Connection conn = secondaryDevDataSource.getConnection();
+                    conn.setAutoCommit(false);
+                    return conn;
+                }));
+            }
+            for (Future<Connection> f : connFutures) {
+                conns.add(f.get());
+            }
+        } catch (Exception e) {
+            executor.shutdown();
+            for (Connection conn : conns) {
+                try { conn.close(); } catch (Exception ignored) {}
+            }
+            throw new RuntimeException("Failed to acquire connections from datasource pool", e);
+        }
+        
+        BlockingQueue<Connection> connectionQueue = new LinkedBlockingQueue<>(conns);
+        long startExec = System.currentTimeMillis();
+        
+        try {
+            if (!deleteScripts.isEmpty()) {
+                long startDelete = System.currentTimeMillis();
+                Connection deleteConn = conns.get(0);
+                usedConnections.add(deleteConn);
+                try (java.sql.Statement stmt = deleteConn.createStatement()) {
+                    for (String deleteSql : deleteScripts) {
+                        if (deleteSql.endsWith(";")) deleteSql = deleteSql.substring(0, deleteSql.length() - 1);
+                        stmt.addBatch(deleteSql);
+                    }
+                    stmt.executeBatch();
                 }
             }
+            
+            for (Map.Entry<Integer, Map<String, List<Object[]>>> levelEntry : levelsMap.entrySet()) {
+                Map<String, List<Object[]>> templates = levelEntry.getValue();
+                List<Future<Void>> futures = new ArrayList<>();
+                for (Map.Entry<String, List<Object[]>> templateEntry : templates.entrySet()) {
+                    String sql = templateEntry.getKey();
+                    List<Object[]> argsList = templateEntry.getValue();
+                    int chunkSize = Math.max(1000, (int) Math.ceil((double) argsList.size() / numConnections));
+                    for (int i = 0; i < argsList.size(); i += chunkSize) {
+                        List<Object[]> chunk = argsList.subList(i, Math.min(argsList.size(), i + chunkSize));
+                        futures.add(executor.submit(() -> {
+                            Connection conn = connectionQueue.take();
+                            usedConnections.add(conn);
+                            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                                for (Object[] args : chunk) {
+                                    for (int j = 0; j < args.length; j++) {
+                                        if (args[j] == null) ps.setNull(j + 1, java.sql.Types.VARCHAR);
+                                        else ps.setObject(j + 1, args[j]);
+                                    }
+                                    ps.addBatch();
+                                }
+                                ps.executeBatch();
+                            } finally {
+                                connectionQueue.put(conn);
+                            }
+                            return null;
+                        }));
+                    }
+                }
+                for (Future<Void> future : futures) {
+                    future.get();
+                }
+            }
+            
+            // Parallel commit — only on connections that did actual work
+            long startCommit = System.currentTimeMillis();
+            List<Future<Void>> commitFutures = new ArrayList<>();
+            for (Connection conn : usedConnections) {
+                commitFutures.add(executor.submit(() -> { conn.commit(); return null; }));
+            }
+            for (Future<Void> f : commitFutures) {
+                f.get();
+            }
+            long endExec = System.currentTimeMillis();
+            System.out.println("Committed " + usedConnections.size() + "/" + numConnections
+                    + " connections in " + (endExec - startCommit) + " ms. "
+                    + "Total: " + (endExec - startExec) + " ms.");
+        } catch (Exception e) {
+            for (Connection conn : conns) {
+                try { conn.rollback(); } catch (Exception ignored) {}
+            }
+            throw new RuntimeException("Script execution failed and all changes were rolled back.", e);
+        } finally {
+            executor.shutdown();
+            for (Connection conn : conns) {
+                try { conn.close(); } catch (Exception ignored) {}
+            }
         }
-        if (!batch.isEmpty()) {
-            batchCount++;
-            totalExecuted += batch.size();
-            System.out.println("Executing final batch #" + batchCount + " (" + batch.size() + " statements, total executed: " + totalExecuted + ")...");
-            long startBatch = System.currentTimeMillis();
-            jdbc.batchUpdate(batch.toArray(new String[0]));
-            long endBatch = System.currentTimeMillis();
-            System.out.println("Final batch #" + batchCount + " executed in " + (endBatch - startBatch) + " ms.");
+    }
+
+    private int getInsertLevel(String sql) {
+        String upper = sql.toUpperCase();
+        if (upper.contains("ASSECURITYGROUP")) {
+            return 0;
         }
-        long endTime = System.currentTimeMillis();
-        System.out.println("Total script execution finished in " + (endTime - startTime) + " ms.");
+        if (upper.contains("ASAUTHCOMPANYPAGEBUTTON")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHCOMPANYPAGE")) {
+            return 2;
+        }
+        if (upper.contains("ASAUTHCOMPANYINQUIRY")) {
+            return 2;
+        }
+        if (upper.contains("ASAUTHCOMPANYWEBSERVICE")) {
+            return 2;
+        }
+        if (upper.contains("ASAUTHCOMPANY")) {
+            return 1;
+        }
+        if (upper.contains("ASAUTHPLANPAGEBUTTON")) {
+            return 4;
+        }
+        if (upper.contains("ASAUTHPLANPAGE")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHTRANSACTIONBUTTON")) {
+            return 4;
+        }
+        if (upper.contains("ASAUTHTRANSACTION")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHPLANINQUIRY")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHPLAN")) {
+            return 2;
+        }
+        if (upper.contains("ASAUTHPRODUCTPAGEBUTTON")) {
+            return 4;
+        }
+        if (upper.contains("ASAUTHPRODUCTPAGE")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHPRODUCTTRANSACTIONBUTTON")) {
+            return 4;
+        }
+        if (upper.contains("ASAUTHPRODUCTTRANSACTION")) {
+            return 3;
+        }
+        if (upper.contains("ASAUTHPRODUCT")) {
+            return 2;
+        }
+        return 5;
+    }
+
+    private <T> List<List<T>> partition(List<T> list, int numParts) {
+        List<List<T>> partitions = new ArrayList<>();
+        if (list == null || list.isEmpty()) {
+            return partitions;
+        }
+        int size = list.size();
+        int chunkSize = (int) Math.ceil((double) size / numParts);
+        for (int i = 0; i < size; i += chunkSize) {
+            partitions.add(list.subList(i, Math.min(size, i + chunkSize)));
+        }
+        return partitions;
     }
 
     /** Escape single quotes for safe SQL string literals. */

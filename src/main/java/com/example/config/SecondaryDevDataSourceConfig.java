@@ -11,6 +11,8 @@ import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
 import org.springframework.orm.jpa.vendor.HibernateJpaVendorAdapter;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
+import com.zaxxer.hikari.HikariDataSource;
+
 @Configuration
 @EnableTransactionManagement
 @EnableJpaRepositories(
@@ -21,8 +23,10 @@ import org.springframework.transaction.annotation.EnableTransactionManagement;
 public class SecondaryDevDataSourceConfig {
 	@Bean(name = "secondaryDevDataSource")
 	@ConfigurationProperties(prefix = "spring.datasource.secondary-dev")
-	public DataSource secondaryDataSource() {
-		return DataSourceBuilder.create().build();
+	public HikariDataSource secondaryDataSource() {
+		HikariDataSource ds = DataSourceBuilder.create().type(HikariDataSource.class).build();
+		ds.setMaximumPoolSize(30);
+		return ds;
 	}
 	
 	@Bean(name = "secondaryDevEntityManagerFactory")

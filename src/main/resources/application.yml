@@ -11,8 +11,7 @@ spring:
       username: OIPA_PAS
       password: OIPA_PAS
       driver-class-name: oracle.jdbc.OracleDriver
-      hikari:
-        maximum-pool-size: 10
+      maximum-pool-size: 30
   jpa:
     hibernate:
       ddl-auto: none
