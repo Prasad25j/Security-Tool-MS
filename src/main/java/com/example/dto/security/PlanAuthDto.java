@@ -5,6 +5,10 @@ import java.util.List;
 
 public class PlanAuthDto {
     private String planGuid;
+    private Boolean selected;
+
+    public Boolean getSelected() { return selected; }
+    public void setSelected(Boolean selected) { this.selected = selected; }
     private List<PageDto> planPages = new ArrayList<>();
     private List<TransactionDto> planTransactions = new ArrayList<>();
     private List<InquiryDto> planInquiries = new ArrayList<>();

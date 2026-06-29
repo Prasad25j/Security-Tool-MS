@@ -5,6 +5,10 @@ import java.util.List;
 
 public class CompanyAuthDto {
     private String companyGuid;
+    private Boolean selected;
+
+    public Boolean getSelected() { return selected; }
+    public void setSelected(Boolean selected) { this.selected = selected; }
     private List<PageDto> companyPages = new ArrayList<>();
     private List<InquiryDto> companyInquiries = new ArrayList<>();
     private List<WebServiceDto> companyWebServices = new ArrayList<>();

@@ -2,8 +2,11 @@ package com.example.controller;
 
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -35,6 +38,8 @@ import com.example.service.SecurityGroupService;
 @RestController
 @RequestMapping("/api")
 public class SecurityGroupController {
+
+    private static final Logger log = LoggerFactory.getLogger(SecurityGroupController.class);
 
     @Autowired
     private SecurityGroupService securityGroupService;
@@ -144,6 +149,7 @@ public class SecurityGroupController {
     @PostMapping("/security-groups/create")
     public ResponseEntity<CreateGroupResponseDto> createSecurityGroup(
             @RequestBody CreateGroupRequestDto request) {
+        log.info("REST request to create security group with name: {}", request != null ? request.getGroupName() : null);
         CreateGroupResponseDto response = securityGroupService.createSecurityGroup(request);
         return ResponseEntity.ok(response);
     }
@@ -155,6 +161,7 @@ public class SecurityGroupController {
     @GetMapping({"/security-group/{securityGroupGuid}", "/security-groups/{securityGroupGuid}"})
     public ResponseEntity<SecurityGroupRequestDto> getSecurityConfiguration(
             @PathVariable String securityGroupGuid) {
+        log.info("REST request to get security configuration for group GUID: {}", securityGroupGuid);
         SecurityGroupDto config = securityGroupService.getSecurityConfiguration(securityGroupGuid);
         return ResponseEntity.ok(new SecurityGroupRequestDto(config));
     }
@@ -169,7 +176,23 @@ public class SecurityGroupController {
     @PostMapping({"/security-group/generate-scripts", "/security-groups/generate-scripts"})
     public ResponseEntity<GenerateScriptsResponseDto> generateScripts(
             @RequestBody SecurityGroupRequestDto request) {
+        log.info("REST request to generate delta SQL scripts for group: {} (GUID: {})",
+                request != null && request.getSecurityGroup() != null ? request.getSecurityGroup().getGroupName() : null,
+                request != null && request.getSecurityGroup() != null ? request.getSecurityGroup().getSecurityGroupGuid() : null);
         GenerateScriptsResponseDto response = securityGroupService.generateScripts(request.getSecurityGroup());
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * Generate selective migration SQL scripts based on the selection flags.
+     */
+    @PostMapping({"/security-group/generate-migration-scripts", "/security-groups/generate-migration-scripts"})
+    public ResponseEntity<GenerateScriptsResponseDto> generateMigrationScripts(
+            @RequestBody SecurityGroupRequestDto request) {
+        log.info("REST request to generate selective migration SQL scripts for group: {} (GUID: {})",
+                request != null && request.getSecurityGroup() != null ? request.getSecurityGroup().getGroupName() : null,
+                request != null && request.getSecurityGroup() != null ? request.getSecurityGroup().getSecurityGroupGuid() : null);
+        GenerateScriptsResponseDto response = securityGroupService.generateMigrationScripts(request.getSecurityGroup());
         return ResponseEntity.ok(response);
     }
 
@@ -179,7 +202,19 @@ public class SecurityGroupController {
     @PostMapping({"/security-group/execute-scripts", "/security-groups/execute-scripts"})
     public ResponseEntity<Void> executeScripts(
             @RequestBody List<String> scripts) {
+        log.info("REST request to execute {} scripts", scripts != null ? scripts.size() : 0);
         securityGroupService.executeScripts(scripts);
+        return ResponseEntity.ok().build();
+    }
+
+    /**
+     * Delete a security group and all its nested relations.
+     */
+    @DeleteMapping({"/security-group/{securityGroupGuid}", "/security-groups/{securityGroupGuid}"})
+    public ResponseEntity<Void> deleteSecurityGroup(
+            @PathVariable String securityGroupGuid) {
+        log.info("REST request to delete security group GUID: {}", securityGroupGuid);
+        securityGroupService.deleteSecurityGroup(securityGroupGuid);
         return ResponseEntity.ok().build();
     }
 }

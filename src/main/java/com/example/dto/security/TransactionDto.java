@@ -5,6 +5,10 @@ import java.util.List;
 
 public class TransactionDto {
     private String transactionGuid;
+    private Boolean selected;
+
+    public Boolean getSelected() { return selected; }
+    public void setSelected(Boolean selected) { this.selected = selected; }
     private List<ButtonDto> buttons = new ArrayList<>();
 
     public TransactionDto() {}

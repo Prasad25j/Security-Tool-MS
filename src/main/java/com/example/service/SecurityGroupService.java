@@ -1,5 +1,8 @@
 package com.example.service;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -47,6 +50,8 @@ import com.example.secondaryDev.repository.*;
  */
 @Service
 public class SecurityGroupService {
+
+    private static final Logger log = LoggerFactory.getLogger(SecurityGroupService.class);
 
     // ── Repositories (all wired to secondarydev) ────────────────────────
     @Autowired private AsSecurityGroupRepository securityGroupRepo;
@@ -204,6 +209,7 @@ public class SecurityGroupService {
     // ===================================================================
     public CreateGroupResponseDto createSecurityGroup(CreateGroupRequestDto request) {
         String groupName = request.getGroupName();
+        log.info("Creating security group: {}", groupName);
 
         // Generate a GUID — SECURITYGROUPGUID is CHAR(144) in the DB
         String guid = java.util.UUID.randomUUID().toString().toUpperCase();
@@ -213,6 +219,7 @@ public class SecurityGroupService {
             "INSERT INTO ASSECURITYGROUP (SECURITYGROUPGUID, GROUPNAME) VALUES ('%s', '%s');",
             esc(guid), esc(groupName));
 
+        log.info("Successfully created dry-run for security group {} with GUID {}", groupName, guid);
         return new CreateGroupResponseDto(guid, groupName, insertScript);
     }
 
@@ -221,6 +228,7 @@ public class SecurityGroupService {
     // ===================================================================
     @Transactional(value = "secondaryDevTransactionManager", readOnly = true)
     public SecurityGroupDto getSecurityConfiguration(String securityGroupGuid) {
+        log.info("Fetching security configuration for group GUID: {}", securityGroupGuid);
 
         // Fetch the group header (or build an empty shell for new groups)
         Optional<AsSecurityGroup> groupOpt = securityGroupRepo.findById(securityGroupGuid);
@@ -229,7 +237,7 @@ public class SecurityGroupService {
         dto.setGroupName(groupOpt.map(AsSecurityGroup::getGROUPNAME).orElse(""));
 
         if (!groupOpt.isPresent()) {
-            // New group — return empty shell
+            log.warn("Security group not found with GUID: {}. Returning empty shell.", securityGroupGuid);
             return dto;
         }
 
@@ -802,6 +810,8 @@ public class SecurityGroupService {
         }
 
         dto.setCompanies(companyDtos);
+        log.info("Successfully fetched security configuration for group: {} (GUID: {}). Total companies: {}",
+                dto.getGroupName(), securityGroupGuid, companyDtos.size());
         return dto;
     }
 
@@ -810,15 +820,10 @@ public class SecurityGroupService {
     // ===================================================================
     @Transactional(value = "secondaryDevTransactionManager", readOnly = true)
     public GenerateScriptsResponseDto generateScripts(SecurityGroupDto incoming) {
-
         String guid = incoming.getSecurityGroupGuid();
         String groupName = incoming.getGroupName();
+        log.info("Generating scripts for security group: {} (GUID: {})", groupName, guid);
         boolean isNewGroup = (guid == null || guid.trim().isEmpty());
-
-        // Restrict modifying the IT ADMIN group
-        if (groupName != null && groupName.trim().equalsIgnoreCase("IT ADMIN")) {
-            throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
-        }
 
         // Step A — Read existing state
         SecurityGroupDto existing;
@@ -829,9 +834,6 @@ public class SecurityGroupService {
             existing = new SecurityGroupDto(guid, groupName);
         } else {
             existing = getSecurityConfiguration(guid);
-            if (existing != null && existing.getGroupName() != null && existing.getGroupName().trim().equalsIgnoreCase("IT ADMIN")) {
-                throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
-            }
         }
 
         // Step B & C — Compare and generate SQL
@@ -1187,7 +1189,267 @@ public class SecurityGroupService {
                 esc(parentAuthGuid), esc(p[4])));
         });
 
+        log.info("Generated {} delta SQL scripts for security group: {} (GUID: {})", scripts.size(), groupName, guid);
         return new GenerateScriptsResponseDto(guid, groupName, scripts);
+    }
+
+    @Transactional(value = "secondaryDevTransactionManager", readOnly = true)
+    public GenerateScriptsResponseDto generateMigrationScripts(SecurityGroupDto incoming) {
+        String guid = incoming.getSecurityGroupGuid();
+        String groupName = incoming.getGroupName();
+        log.info("Generating migration scripts for security group: {} (GUID: {})", groupName, guid);
+
+        List<String> scripts = new ArrayList<>();
+        List<MigrationScriptDto> migrationScripts = new ArrayList<>();
+        Map<String, String> authGuidMap = new java.util.HashMap<>();
+        if (guid != null && !guid.trim().isEmpty()) {
+            loadExistingAuthGuids(guid, authGuidMap);
+        }
+
+        // Helper to safely get or generate a GUID for a composite key
+        java.util.function.Function<String, String> getOrGen = (key) -> {
+            String existingGuid = authGuidMap.get(key);
+            if (existingGuid == null || existingGuid.trim().isEmpty()) {
+                existingGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+                authGuidMap.put(key, existingGuid);
+            }
+            return existingGuid.trim();
+        };
+
+        // 1. Security Group
+        String sgScript = String.format(
+            "INSERT INTO ASSECURITYGROUP (SECURITYGROUPGUID, GROUPNAME) VALUES ('%s', '%s');",
+            esc(guid), esc(groupName));
+        scripts.add("-- ====== SECURITY GROUP ======");
+        scripts.add(sgScript);
+        migrationScripts.add(new MigrationScriptDto(null, null, null, "SECURITY_GROUP", guid, sgScript));
+
+        if (incoming.getCompanies() != null) {
+            for (CompanyAuthDto company : incoming.getCompanies()) {
+                String companyGuid = company.getCompanyGuid();
+                String compKey = guid + "|" + companyGuid;
+                String authCompanyGuid = getOrGen.apply(compKey);
+
+                String compScript = String.format(
+                    "INSERT INTO ASAUTHCOMPANY (AUTHCOMPANYGUID, COMPANYGUID, SECURITYGROUPGUID) VALUES ('%s', '%s', '%s');",
+                    esc(authCompanyGuid), esc(companyGuid), esc(guid));
+                scripts.add(compScript);
+                migrationScripts.add(new MigrationScriptDto(companyGuid, null, null, "COMPANY", companyGuid, compScript));
+
+                // Company Pages
+                if (company.getCompanyPages() != null) {
+                    for (PageDto page : company.getCompanyPages()) {
+                        String pageGuid = page.getPageGuid();
+                        String pageKey = compKey + "|" + pageGuid;
+                        String authPageGuid = getOrGen.apply(pageKey);
+
+                        String pageScript = String.format(
+                            "INSERT INTO ASAUTHCOMPANYPAGE (AUTHCOMPANYPAGEGUID, AUTHCOMPANYGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                            esc(authPageGuid), esc(authCompanyGuid), esc(pageGuid));
+                        scripts.add(pageScript);
+                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, null, "COMPANY_PAGE", pageGuid, pageScript));
+
+                        // Company Page Buttons
+                        if (page.getButtons() != null) {
+                            for (ButtonDto button : page.getButtons()) {
+                                String buttonGuid = button.getButtonGuid();
+                                String btnKey = pageKey + "|" + buttonGuid;
+                                String authBtnGuid = getOrGen.apply(btnKey);
+
+                                String btnScript = String.format(
+                                    "INSERT INTO ASAUTHCOMPANYPAGEBUTTON (AUTHCOMPANYPAGEBUTTONGUID, AUTHCOMPANYPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authBtnGuid), esc(authPageGuid), esc(buttonGuid));
+                                scripts.add(btnScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, null, null, "COMPANY_BUTTON", buttonGuid, btnScript));
+                            }
+                        }
+                    }
+                }
+
+                // Company Inquiries
+                if (company.getCompanyInquiries() != null) {
+                    for (InquiryDto inquiry : company.getCompanyInquiries()) {
+                        String inqGuid = inquiry.getInquiryScreenNameGuid();
+                        String inqKey = compKey + "|" + inqGuid;
+                        String authInqGuid = getOrGen.apply(inqKey);
+
+                        String inqScript = String.format(
+                            "INSERT INTO ASAUTHCOMPANYINQUIRY (AUTHCOMPANYINQUIRYGUID, AUTHCOMPANYGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                            esc(authInqGuid), esc(authCompanyGuid), esc(inqGuid));
+                        scripts.add(inqScript);
+                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, null, "COMPANY_INQUIRY", inqGuid, inqScript));
+                    }
+                }
+
+                // Company Web Services
+                if (company.getCompanyWebServices() != null) {
+                    for (WebServiceDto ws : company.getCompanyWebServices()) {
+                        String wsGuid = ws.getWebServiceGuid();
+                        String wsScript = String.format(
+                            "INSERT INTO ASAUTHCOMPANYWEBSERVICE (AUTHWEBSERVICEGUID, AUTHCOMPANYGUID) VALUES ('%s', '%s');",
+                            esc(wsGuid), esc(authCompanyGuid));
+                        scripts.add(wsScript);
+                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, null, "COMPANY_WEBSERVICE", wsGuid, wsScript));
+                    }
+                }
+
+                // Plans
+                if (company.getPlans() != null) {
+                    for (PlanAuthDto plan : company.getPlans()) {
+                        String planGuid = plan.getPlanGuid();
+                        String planKey = compKey + "|" + planGuid;
+                        String authPlanGuid = getOrGen.apply(planKey);
+
+                        String planScript = String.format(
+                            "INSERT INTO ASAUTHPLAN (AUTHPLANGUID, AUTHCOMPANYGUID, PLANGUID) VALUES ('%s', '%s', '%s');",
+                            esc(authPlanGuid), esc(authCompanyGuid), esc(planGuid));
+                        scripts.add(planScript);
+                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN", planGuid, planScript));
+
+                        // Plan Pages
+                        if (plan.getPlanPages() != null) {
+                            for (PageDto page : plan.getPlanPages()) {
+                                String pageGuid = page.getPageGuid();
+                                String planPageKey = planKey + "|" + pageGuid;
+                                String authPlanPageGuid = getOrGen.apply(planPageKey);
+
+                                String pageScript = String.format(
+                                    "INSERT INTO ASAUTHPLANPAGE (AUTHPLANPAGEGUID, AUTHPLANGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authPlanPageGuid), esc(authPlanGuid), esc(pageGuid));
+                                scripts.add(pageScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN_PAGE", pageGuid, pageScript));
+
+                                // Plan Page Buttons
+                                if (page.getButtons() != null) {
+                                    for (ButtonDto button : page.getButtons()) {
+                                        String buttonGuid = button.getButtonGuid();
+                                        String btnScript = String.format(
+                                            "INSERT INTO ASAUTHPLANPAGEBUTTON (AUTHPLANPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                                            esc(authPlanPageGuid), esc(buttonGuid));
+                                        scripts.add(btnScript);
+                                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN_PAGE_BUTTON", buttonGuid, btnScript));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Plan Transactions
+                        if (plan.getPlanTransactions() != null) {
+                            for (TransactionDto txn : plan.getPlanTransactions()) {
+                                String txnGuid = txn.getTransactionGuid();
+                                String txnKey = planKey + "|" + txnGuid;
+                                String authTxnGuid = getOrGen.apply(txnKey);
+
+                                String txnScript = String.format(
+                                    "INSERT INTO ASAUTHTRANSACTION (AUTHTRANSACTIONGUID, AUTHPLANGUID, TRANSACTIONGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authTxnGuid), esc(authPlanGuid), esc(txnGuid));
+                                scripts.add(txnScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN_TRANSACTION", txnGuid, txnScript));
+
+                                // Plan Transaction Buttons
+                                if (txn.getButtons() != null) {
+                                    for (ButtonDto button : txn.getButtons()) {
+                                        String buttonGuid = button.getButtonGuid();
+                                        String btnScript = String.format(
+                                            "INSERT INTO ASAUTHTRANSACTIONBUTTON (AUTHTRANSACTIONGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                                            esc(authTxnGuid), esc(buttonGuid));
+                                        scripts.add(btnScript);
+                                        migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN_TRANSACTION_BUTTON", buttonGuid, btnScript));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Plan Inquiries
+                        if (plan.getPlanInquiries() != null) {
+                            for (InquiryDto inquiry : plan.getPlanInquiries()) {
+                                String inqGuid = inquiry.getInquiryScreenNameGuid();
+                                String piKey = planKey + "|" + inqGuid;
+                                String authPiGuid = getOrGen.apply(piKey);
+
+                                String inqScript = String.format(
+                                    "INSERT INTO ASAUTHPLANINQUIRY (AUTHPLANINQUIRYGUID, AUTHPLANGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authPiGuid), esc(authPlanGuid), esc(inqGuid));
+                                scripts.add(inqScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, null, planGuid, "PLAN_INQUIRY", inqGuid, inqScript));
+                            }
+                        }
+                    }
+                }
+
+                // Products
+                if (company.getProducts() != null) {
+                    for (ProductAuthDto product : company.getProducts()) {
+                        String productGuid = product.getProductGuid();
+                        String prodKey = compKey + "|" + productGuid;
+                        String authProdGuid = getOrGen.apply(prodKey);
+
+                        String prodScript = String.format(
+                            "INSERT INTO ASAUTHPRODUCT (AUTHPRODUCTGUID, AUTHCOMPANYGUID, PRODUCTGUID) VALUES ('%s', '%s', '%s');",
+                            esc(authProdGuid), esc(authCompanyGuid), esc(productGuid));
+                        scripts.add(prodScript);
+                        migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT", productGuid, prodScript));
+
+                        // Product Pages
+                        if (product.getProductPages() != null) {
+                            for (PageDto page : product.getProductPages()) {
+                                String pageGuid = page.getPageGuid();
+                                String prodPageKey = prodKey + "|" + pageGuid;
+                                String authProdPageGuid = getOrGen.apply(prodPageKey);
+
+                                String pageScript = String.format(
+                                    "INSERT INTO ASAUTHPRODUCTPAGE (AUTHPRODUCTPAGEGUID, AUTHPRODUCTGUID, AUTHPAGEGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authProdPageGuid), esc(authProdGuid), esc(pageGuid));
+                                scripts.add(pageScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT_PAGE", pageGuid, pageScript));
+
+                                // Product Page Buttons
+                                if (page.getButtons() != null) {
+                                    for (ButtonDto button : page.getButtons()) {
+                                        String buttonGuid = button.getButtonGuid();
+                                        String btnScript = String.format(
+                                            "INSERT INTO ASAUTHPRODUCTPAGEBUTTON (AUTHPRODUCTPAGEGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                                            esc(authProdPageGuid), esc(buttonGuid));
+                                        scripts.add(btnScript);
+                                        migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT_BUTTON", buttonGuid, btnScript));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Product Transactions
+                        if (product.getProductTransactions() != null) {
+                            for (TransactionDto txn : product.getProductTransactions()) {
+                                String txnGuid = txn.getTransactionGuid();
+                                String txnKey = prodKey + "|" + txnGuid;
+                                String authProdTxnGuid = getOrGen.apply(txnKey);
+
+                                String txnScript = String.format(
+                                    "INSERT INTO ASAUTHPRODUCTTRANSACTION (AUTHPRODUCTTRANSACTIONGUID, AUTHPRODUCTGUID, TRANSACTIONGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authProdTxnGuid), esc(authProdGuid), esc(txnGuid));
+                                scripts.add(txnScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT_TRANSACTION", txnGuid, txnScript));
+
+                                // Product Transaction Buttons
+                                if (txn.getButtons() != null) {
+                                    for (ButtonDto button : txn.getButtons()) {
+                                        String buttonGuid = button.getButtonGuid();
+                                        String btnScript = String.format(
+                                            "INSERT INTO ASAUTHPRODUCTTRANSACTIONBUTTON (AUTHPRODUCTTRANSACTIONGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
+                                            esc(authProdTxnGuid), esc(buttonGuid));
+                                        scripts.add(btnScript);
+                                        migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT_TRANSACTION_BUTTON", buttonGuid, btnScript));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        log.info("Generated {} migration SQL scripts for security group: {} (GUID: {})", scripts.size(), groupName, guid);
+        return new GenerateScriptsResponseDto(guid, groupName, scripts, migrationScripts);
     }
 
     private void loadExistingAuthGuids(String securityGroupGuid, Map<String, String> authGuidMap) {
@@ -1306,6 +1568,52 @@ public class SecurityGroupService {
                 String prod = rs.getString("PRODUCTGUID");
                 String txn = rs.getString("TRANSACTIONGUID");
                 authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (prod != null ? prod.trim() : "") + "|" + (txn != null ? txn.trim() : ""), rs.getString("AUTHPRODUCTTRANSACTIONGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 9. Company Page Buttons
+        jdbc.query(
+            "SELECT cpb.AUTHCOMPANYPAGEBUTTONGUID, c.COMPANYGUID, cp.AUTHPAGEGUID, cpb.AUTHBUTTONGUID " +
+            "FROM ASAUTHCOMPANYPAGEBUTTON cpb " +
+            "JOIN ASAUTHCOMPANYPAGE cp ON cpb.AUTHCOMPANYPAGEGUID = cp.AUTHCOMPANYPAGEGUID " +
+            "JOIN ASAUTHCOMPANY c ON cp.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String pg = rs.getString("AUTHPAGEGUID");
+                String btn = rs.getString("AUTHBUTTONGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (pg != null ? pg.trim() : "") + "|" + (btn != null ? btn.trim() : ""), rs.getString("AUTHCOMPANYPAGEBUTTONGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 10. Company Inquiries
+        jdbc.query(
+            "SELECT ci.AUTHCOMPANYINQUIRYGUID, c.COMPANYGUID, ci.INQUIRYSCREENNAMEGUID " +
+            "FROM ASAUTHCOMPANYINQUIRY ci " +
+            "JOIN ASAUTHCOMPANY c ON ci.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String inq = rs.getString("INQUIRYSCREENNAMEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (inq != null ? inq.trim() : ""), rs.getString("AUTHCOMPANYINQUIRYGUID"));
+            },
+            securityGroupGuid
+        );
+
+        // 11. Plan Inquiries
+        jdbc.query(
+            "SELECT pi.AUTHPLANINQUIRYGUID, c.COMPANYGUID, p.PLANGUID, pi.INQUIRYSCREENNAMEGUID " +
+            "FROM ASAUTHPLANINQUIRY pi " +
+            "JOIN ASAUTHPLAN p ON pi.AUTHPLANGUID = p.AUTHPLANGUID " +
+            "JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String plan = rs.getString("PLANGUID");
+                String inq = rs.getString("INQUIRYSCREENNAMEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (plan != null ? plan.trim() : "") + "|" + (inq != null ? inq.trim() : ""), rs.getString("AUTHPLANINQUIRYGUID"));
             },
             securityGroupGuid
         );
@@ -1587,13 +1895,108 @@ public class SecurityGroupService {
         return new ParameterizedSql(tSql, args.toArray());
     }
 
+    private Set<String> getItAdminGuids() {
+        Set<String> guids = new java.util.HashSet<>();
+        JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+        
+        // Get IT ADMIN Security Group GUID
+        List<String> groupGuids = jdbc.query(
+            "SELECT SECURITYGROUPGUID FROM ASSECURITYGROUP WHERE UPPER(TRIM(GROUPNAME)) = 'IT ADMIN'",
+            (rs, rowNum) -> rs.getString("SECURITYGROUPGUID")
+        );
+        if (groupGuids.isEmpty()) {
+            return guids;
+        }
+        String itAdminGuid = groupGuids.get(0);
+        if (itAdminGuid != null) {
+            guids.add(itAdminGuid.trim().toUpperCase());
+        }
+        
+        // Load all child authorization GUIDs for IT ADMIN
+        // 1. Companies
+        jdbc.query("SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHCOMPANYGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+            
+        // 2. Company Pages
+        jdbc.query("SELECT cp.AUTHCOMPANYPAGEGUID FROM ASAUTHCOMPANYPAGE cp JOIN ASAUTHCOMPANY c ON cp.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHCOMPANYPAGEGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+            
+        // 3. Company Page Buttons
+        jdbc.query("SELECT cpb.AUTHCOMPANYPAGEBUTTONGUID FROM ASAUTHCOMPANYPAGEBUTTON cpb JOIN ASAUTHCOMPANYPAGE cp ON cpb.AUTHCOMPANYPAGEGUID = cp.AUTHCOMPANYPAGEGUID JOIN ASAUTHCOMPANY c ON cp.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHCOMPANYPAGEBUTTONGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 4. Company Inquiries
+        jdbc.query("SELECT ci.AUTHCOMPANYINQUIRYGUID FROM ASAUTHCOMPANYINQUIRY ci JOIN ASAUTHCOMPANY c ON ci.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHCOMPANYINQUIRYGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 5. Plans
+        jdbc.query("SELECT p.AUTHPLANGUID FROM ASAUTHPLAN p JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPLANGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 6. Plan Pages
+        jdbc.query("SELECT pp.AUTHPLANPAGEGUID FROM ASAUTHPLANPAGE pp JOIN ASAUTHPLAN p ON pp.AUTHPLANGUID = p.AUTHPLANGUID JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPLANPAGEGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 7. Plan Inquiries
+        jdbc.query("SELECT pi.AUTHPLANINQUIRYGUID FROM ASAUTHPLANINQUIRY pi JOIN ASAUTHPLAN p ON pi.AUTHPLANGUID = p.AUTHPLANGUID JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPLANINQUIRYGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 8. Transactions
+        jdbc.query("SELECT t.AUTHTRANSACTIONGUID FROM ASAUTHTRANSACTION t JOIN ASAUTHPLAN p ON t.AUTHPLANGUID = p.AUTHPLANGUID JOIN ASAUTHCOMPANY c ON p.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHTRANSACTIONGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 9. Products
+        jdbc.query("SELECT pr.AUTHPRODUCTGUID FROM ASAUTHPRODUCT pr JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPRODUCTGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 10. Product Pages
+        jdbc.query("SELECT pp.AUTHPRODUCTPAGEGUID FROM ASAUTHPRODUCTPAGE pp JOIN ASAUTHPRODUCT pr ON pp.AUTHPRODUCTGUID = pr.AUTHPRODUCTGUID JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPRODUCTPAGEGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        // 11. Product Transactions
+        jdbc.query("SELECT pt.AUTHPRODUCTTRANSACTIONGUID FROM ASAUTHPRODUCTTRANSACTION pt JOIN ASAUTHPRODUCT pr ON pt.AUTHPRODUCTGUID = pr.AUTHPRODUCTGUID JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID WHERE c.SECURITYGROUPGUID = ?",
+            rs -> { String g = rs.getString("AUTHPRODUCTTRANSACTIONGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
+            itAdminGuid);
+
+        return guids;
+    }
 
     /** Execute generated delta SQL scripts on secondaryDev database. */
     @Transactional(value = "secondaryDevTransactionManager")
     public void executeScripts(List<String> scripts) {
         if (scripts == null || scripts.isEmpty()) {
+            log.info("No scripts to execute.");
             return;
         }
+
+        // Relocated block: restrict modifying IT ADMIN group on execution
+        Set<String> itAdminGuids = getItAdminGuids();
+        for (String script : scripts) {
+            if (script == null) continue;
+            String upper = script.toUpperCase();
+            if (upper.contains("'IT ADMIN'") || upper.contains("\"IT ADMIN\"")) {
+                throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+            }
+            if (!itAdminGuids.isEmpty()) {
+                for (String guid : itAdminGuids) {
+                    if (upper.contains(guid)) {
+                        throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+                    }
+                }
+            }
+        }
+
+        log.info("Starting execution of {} SQL scripts on secondaryDev database", scripts.size());
         
         List<String> deleteScripts = new ArrayList<>();
         List<String> insertScripts = new ArrayList<>();
@@ -1609,6 +2012,7 @@ public class SecurityGroupService {
                 insertScripts.add(trimmed);
             }
         }
+        log.info("Parsed scripts: {} DELETE statements, {} INSERT statements", deleteScripts.size(), insertScripts.size());
         
         Map<String, List<Object[]>> batchedInserts = new java.util.LinkedHashMap<>();
         for (String script : insertScripts) {
@@ -1710,10 +2114,10 @@ public class SecurityGroupService {
                 f.get();
             }
             long endExec = System.currentTimeMillis();
-            System.out.println("Committed " + usedConnections.size() + "/" + numConnections
-                    + " connections in " + (endExec - startCommit) + " ms. "
-                    + "Total: " + (endExec - startExec) + " ms.");
+            log.info("Committed {}/{} connections in {} ms. Total execution time: {} ms.",
+                    usedConnections.size(), numConnections, (endExec - startCommit), (endExec - startExec));
         } catch (Exception e) {
+            log.error("Error occurred during script execution. Rolling back all connections.", e);
             for (Connection conn : conns) {
                 try { conn.rollback(); } catch (Exception ignored) {}
             }
@@ -1799,6 +2203,182 @@ public class SecurityGroupService {
     private String esc(String value) {
         if (value == null) return "";
         return value.replace("'", "''");
+    }
+
+    /**
+     * Delete a security group and all its nested configuration/relations
+     * from the secondaryDev database.
+     */
+    @Transactional(value = "secondaryDevTransactionManager")
+    public void deleteSecurityGroup(String securityGroupGuid) {
+        log.info("Request to delete security group GUID: {}", securityGroupGuid);
+        
+        AsSecurityGroup group = securityGroupRepo.findById(securityGroupGuid)
+                .orElseThrow(() -> {
+                    log.error("Security group not found with GUID: {}", securityGroupGuid);
+                    return new IllegalArgumentException("Security group not found with GUID: " + securityGroupGuid);
+                });
+
+        if (group.getGROUPNAME() != null && group.getGROUPNAME().trim().equalsIgnoreCase("IT ADMIN")) {
+            log.error("Restrict deletion: Cannot delete 'IT ADMIN' security group.");
+            throw new IllegalArgumentException("Deleting the 'IT ADMIN' security group is restricted as it is the base group for all.");
+        }
+
+        JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+        long startTime = System.currentTimeMillis();
+
+        log.info("Deleting dependent authorization records for security group: {} (GUID: {})", 
+                group.getGROUPNAME(), securityGroupGuid);
+
+        // 1. ASAUTHPRODUCTTRANSACTIONBUTTON
+        int count1 = jdbc.update(
+            "DELETE FROM ASAUTHPRODUCTTRANSACTIONBUTTON WHERE AUTHPRODUCTTRANSACTIONGUID IN (" +
+            "  SELECT apt.AUTHPRODUCTTRANSACTIONGUID FROM ASAUTHPRODUCTTRANSACTION apt" +
+            "  JOIN ASAUTHPRODUCT ap ON apt.AUTHPRODUCTGUID = ap.AUTHPRODUCTGUID" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPRODUCTTRANSACTIONBUTTON", count1);
+
+        // 2. ASAUTHTRANSACTIONBUTTON
+        int count2 = jdbc.update(
+            "DELETE FROM ASAUTHTRANSACTIONBUTTON WHERE AUTHTRANSACTIONGUID IN (" +
+            "  SELECT at.AUTHTRANSACTIONGUID FROM ASAUTHTRANSACTION at" +
+            "  JOIN ASAUTHPLAN ap ON at.AUTHPLANGUID = ap.AUTHPLANGUID" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHTRANSACTIONBUTTON", count2);
+
+        // 3. ASAUTHPRODUCTPAGEBUTTON
+        int count3 = jdbc.update(
+            "DELETE FROM ASAUTHPRODUCTPAGEBUTTON WHERE AUTHPRODUCTPAGEGUID IN (" +
+            "  SELECT app.AUTHPRODUCTPAGEGUID FROM ASAUTHPRODUCTPAGE app" +
+            "  JOIN ASAUTHPRODUCT ap ON apt.AUTHPRODUCTGUID = ap.AUTHPRODUCTGUID" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPRODUCTPAGEBUTTON", count3);
+
+        // 4. ASAUTHPRODUCTPAGE
+        int count4 = jdbc.update(
+            "DELETE FROM ASAUTHPRODUCTPAGE WHERE AUTHPRODUCTGUID IN (" +
+            "  SELECT ap.AUTHPRODUCTGUID FROM ASAUTHPRODUCT ap" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPRODUCTPAGE", count4);
+
+        // 5. ASAUTHPRODUCTTRANSACTION
+        int count5 = jdbc.update(
+            "DELETE FROM ASAUTHPRODUCTTRANSACTION WHERE AUTHPRODUCTGUID IN (" +
+            "  SELECT ap.AUTHPRODUCTGUID FROM ASAUTHPRODUCT ap" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPRODUCTTRANSACTION", count5);
+
+        // 6. ASAUTHPRODUCT
+        int count6 = jdbc.update(
+            "DELETE FROM ASAUTHPRODUCT WHERE AUTHCOMPANYGUID IN (" +
+            "  SELECT ac.AUTHCOMPANYGUID FROM ASAUTHCOMPANY ac" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPRODUCT", count6);
+
+        // 7. ASAUTHPLANPAGEBUTTON
+        int count7 = jdbc.update(
+            "DELETE FROM ASAUTHPLANPAGEBUTTON WHERE AUTHPLANPAGEGUID IN (" +
+            "  SELECT app.AUTHPLANPAGEGUID FROM ASAUTHPLANPAGE app" +
+            "  JOIN ASAUTHPLAN ap ON app.AUTHPLANGUID = ap.AUTHPLANGUID" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPLANPAGEBUTTON", count7);
+
+        // 8. ASAUTHPLANPAGE
+        int count8 = jdbc.update(
+            "DELETE FROM ASAUTHPLANPAGE WHERE AUTHPLANGUID IN (" +
+            "  SELECT ap.AUTHPLANGUID FROM ASAUTHPLAN ap" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPLANPAGE", count8);
+
+        // 9. ASAUTHTRANSACTION
+        int count9 = jdbc.update(
+            "DELETE FROM ASAUTHTRANSACTION WHERE AUTHPLANGUID IN (" +
+            "  SELECT ap.AUTHPLANGUID FROM ASAUTHPLAN ap" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHTRANSACTION", count9);
+
+        // 10. ASAUTHPLANINQUIRY
+        int count10 = jdbc.update(
+            "DELETE FROM ASAUTHPLANINQUIRY WHERE AUTHPLANGUID IN (" +
+            "  SELECT ap.AUTHPLANGUID FROM ASAUTHPLAN ap" +
+            "  JOIN ASAUTHCOMPANY ac ON ap.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPLANINQUIRY", count10);
+
+        // 11. ASAUTHPLAN
+        int count11 = jdbc.update(
+            "DELETE FROM ASAUTHPLAN WHERE AUTHCOMPANYGUID IN (" +
+            "  SELECT ac.AUTHCOMPANYGUID FROM ASAUTHCOMPANY ac" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHPLAN", count11);
+
+        // 12. ASAUTHCOMPANYPAGEBUTTON
+        int count12 = jdbc.update(
+            "DELETE FROM ASAUTHCOMPANYPAGEBUTTON WHERE AUTHCOMPANYPAGEGUID IN (" +
+            "  SELECT acp.AUTHCOMPANYPAGEGUID FROM ASAUTHCOMPANYPAGE acp" +
+            "  JOIN ASAUTHCOMPANY ac ON acp.AUTHCOMPANYGUID = ac.AUTHCOMPANYGUID" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHCOMPANYPAGEBUTTON", count12);
+
+        // 13. ASAUTHCOMPANYPAGE
+        int count13 = jdbc.update(
+            "DELETE FROM ASAUTHCOMPANYPAGE WHERE AUTHCOMPANYGUID IN (" +
+            "  SELECT ac.AUTHCOMPANYGUID FROM ASAUTHCOMPANY ac" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHCOMPANYPAGE", count13);
+
+        // 14. ASAUTHCOMPANYINQUIRY
+        int count14 = jdbc.update(
+            "DELETE FROM ASAUTHCOMPANYINQUIRY WHERE AUTHCOMPANYGUID IN (" +
+            "  SELECT ac.AUTHCOMPANYGUID FROM ASAUTHCOMPANY ac" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHCOMPANYINQUIRY", count14);
+
+        // 15. ASAUTHCOMPANYWEBSERVICE
+        int count15 = jdbc.update(
+            "DELETE FROM ASAUTHCOMPANYWEBSERVICE WHERE AUTHCOMPANYGUID IN (" +
+            "  SELECT ac.AUTHCOMPANYGUID FROM ASAUTHCOMPANY ac" +
+            "  WHERE ac.SECURITYGROUPGUID = ?" +
+            ")", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHCOMPANYWEBSERVICE", count15);
+
+        // 16. ASAUTHCOMPANY
+        int count16 = jdbc.update(
+            "DELETE FROM ASAUTHCOMPANY WHERE SECURITYGROUPGUID = ?", securityGroupGuid);
+        log.info("Deleted {} rows from ASAUTHCOMPANY", count16);
+
+        // 17. ASSECURITYGROUP
+        int count17 = jdbc.update(
+            "DELETE FROM ASSECURITYGROUP WHERE SECURITYGROUPGUID = ?", securityGroupGuid);
+        log.info("Deleted {} rows from ASSECURITYGROUP", count17);
+
+        long duration = System.currentTimeMillis() - startTime;
+        log.info("Successfully deleted security group {} (GUID: {}). Total affected child rows: {}. Operation took {} ms.", 
+            group.getGROUPNAME(), securityGroupGuid, 
+            (count1 + count2 + count3 + count4 + count5 + count6 + count7 + count8 + count9 + count10 + count11 + count12 + count13 + count14 + count15 + count16 + count17),
+            duration);
     }
 }
 
