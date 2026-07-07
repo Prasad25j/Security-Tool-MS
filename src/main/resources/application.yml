@@ -4,7 +4,7 @@ server:
 
 spring:
   profiles:
-    active: dev
+    active: prod
   servlet:
     multipart:
       max-file-size: 50MB
@@ -26,4 +26,4 @@ logging:
       SQL: DEBUG
       orm:
         jdbc:
-          bind: TRACE
+          bind: TRACE
