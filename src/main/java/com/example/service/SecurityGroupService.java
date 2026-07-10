@@ -82,6 +82,8 @@ public class SecurityGroupService {
     @Autowired @Qualifier("secondaryDevDataSource")
     private DataSource secondaryDevDataSource;
 
+    private volatile Set<String> cachedItAdminGuids = null;
+
 
 
     // ===================================================================
@@ -1896,6 +1898,18 @@ public class SecurityGroupService {
     }
 
     private Set<String> getItAdminGuids() {
+        if (cachedItAdminGuids == null) {
+            synchronized (this) {
+                if (cachedItAdminGuids == null) {
+                    cachedItAdminGuids = fetchItAdminGuidsFromDb();
+                }
+            }
+        }
+        return cachedItAdminGuids;
+    }
+
+    private Set<String> fetchItAdminGuidsFromDb() {
+        log.info("Fetching IT ADMIN GUIDs from database...");
         Set<String> guids = new java.util.HashSet<>();
         JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
         
@@ -1968,6 +1982,7 @@ public class SecurityGroupService {
             rs -> { String g = rs.getString("AUTHPRODUCTTRANSACTIONGUID"); if (g != null) guids.add(g.trim().toUpperCase()); },
             itAdminGuid);
 
+        log.info("Fetched {} IT ADMIN GUIDs.", guids.size());
         return guids;
     }
 
@@ -1979,224 +1994,78 @@ public class SecurityGroupService {
             return;
         }
 
-        // Relocated block: restrict modifying IT ADMIN group on execution
-        Set<String> itAdminGuids = getItAdminGuids();
+        // Check if there are any security scripts targeting ASAUTH or ASSECURITYGROUP
+        boolean hasSecurityScript = false;
         for (String script : scripts) {
             if (script == null) continue;
             String upper = script.toUpperCase();
-            if (upper.contains("'IT ADMIN'") || upper.contains("\"IT ADMIN\"")) {
-                throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
-            }
-            if (!itAdminGuids.isEmpty()) {
-                for (String guid : itAdminGuids) {
-                    if (upper.contains(guid)) {
-                        throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
-                    }
-                }
+            if (upper.contains("ASAUTH") || upper.contains("ASSECURITYGROUP")) {
+                hasSecurityScript = true;
+                break;
             }
         }
 
-        log.info("Starting execution of {} SQL scripts on secondaryDev database", scripts.size());
-        
-        List<String> deleteScripts = new ArrayList<>();
-        List<String> insertScripts = new ArrayList<>();
+        if (hasSecurityScript) {
+            log.info("Security-related scripts detected. Performing IT ADMIN modification checks.");
+            Set<String> itAdminGuids = getItAdminGuids();
+            for (String script : scripts) {
+                if (script == null) continue;
+                String upper = script.toUpperCase();
+                if (upper.contains("'IT ADMIN'") || upper.contains("\"IT ADMIN\"")) {
+                    throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+                }
+                if (!itAdminGuids.isEmpty()) {
+                    for (String guid : itAdminGuids) {
+                        if (upper.contains(guid)) {
+                            throw new IllegalArgumentException("Modifying the 'IT ADMIN' security group is restricted as it is the base group for all.");
+                        }
+                    }
+                }
+            }
+        } else {
+            log.info("Non-security scripts detected. Skipping IT ADMIN checks for performance optimization.");
+        }
+
+        List<String> validScripts = new ArrayList<>();
         for (String script : scripts) {
             if (script == null) continue;
             String trimmed = script.trim();
             if (trimmed.isEmpty() || trimmed.startsWith("--")) {
                 continue;
             }
-            if (trimmed.toUpperCase().startsWith("DELETE")) {
-                deleteScripts.add(trimmed);
-            } else {
-                insertScripts.add(trimmed);
+            if (trimmed.endsWith(";")) {
+                trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+            }
+            if (!trimmed.isEmpty()) {
+                validScripts.add(trimmed);
             }
         }
-        log.info("Parsed scripts: {} DELETE statements, {} INSERT statements", deleteScripts.size(), insertScripts.size());
-        
-        Map<String, List<Object[]>> batchedInserts = new java.util.LinkedHashMap<>();
-        for (String script : insertScripts) {
-            ParameterizedSql paramSql = parameterize(script);
-            List<Object[]> argsList = batchedInserts.computeIfAbsent(paramSql.sql, k -> new ArrayList<>());
-            argsList.add(paramSql.args);
-        }
-        
-        Map<Integer, Map<String, List<Object[]>>> levelsMap = new java.util.TreeMap<>();
-        for (Map.Entry<String, List<Object[]>> entry : batchedInserts.entrySet()) {
-            String sql = entry.getKey();
-            List<Object[]> argsList = entry.getValue();
-            int level = getInsertLevel(sql);
-            levelsMap.computeIfAbsent(level, k -> new java.util.LinkedHashMap<>()).put(sql, argsList);
-        }
-        
-        int numConnections = 24;
-        ExecutorService executor = Executors.newFixedThreadPool(numConnections);
-        List<Connection> conns = new ArrayList<>();
-        Set<Connection> usedConnections = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
-        
-        try {
-            List<Future<Connection>> connFutures = new ArrayList<>();
-            for (int i = 0; i < numConnections; i++) {
-                connFutures.add(executor.submit(() -> {
-                    Connection conn = secondaryDevDataSource.getConnection();
-                    conn.setAutoCommit(false);
-                    return conn;
-                }));
-            }
-            for (Future<Connection> f : connFutures) {
-                conns.add(f.get());
-            }
-        } catch (Exception e) {
-            executor.shutdown();
-            for (Connection conn : conns) {
-                try { conn.close(); } catch (Exception ignored) {}
-            }
-            throw new RuntimeException("Failed to acquire connections from datasource pool", e);
-        }
-        
-        BlockingQueue<Connection> connectionQueue = new LinkedBlockingQueue<>(conns);
-        long startExec = System.currentTimeMillis();
-        
-        try {
-            if (!deleteScripts.isEmpty()) {
-                long startDelete = System.currentTimeMillis();
-                Connection deleteConn = conns.get(0);
-                usedConnections.add(deleteConn);
-                try (java.sql.Statement stmt = deleteConn.createStatement()) {
-                    for (String deleteSql : deleteScripts) {
-                        if (deleteSql.endsWith(";")) deleteSql = deleteSql.substring(0, deleteSql.length() - 1);
-                        stmt.addBatch(deleteSql);
-                    }
-                    stmt.executeBatch();
-                }
-            }
-            
-            for (Map.Entry<Integer, Map<String, List<Object[]>>> levelEntry : levelsMap.entrySet()) {
-                Map<String, List<Object[]>> templates = levelEntry.getValue();
-                List<Future<Void>> futures = new ArrayList<>();
-                for (Map.Entry<String, List<Object[]>> templateEntry : templates.entrySet()) {
-                    String sql = templateEntry.getKey();
-                    List<Object[]> argsList = templateEntry.getValue();
-                    int chunkSize = Math.max(1000, (int) Math.ceil((double) argsList.size() / numConnections));
-                    for (int i = 0; i < argsList.size(); i += chunkSize) {
-                        List<Object[]> chunk = argsList.subList(i, Math.min(argsList.size(), i + chunkSize));
-                        futures.add(executor.submit(() -> {
-                            Connection conn = connectionQueue.take();
-                            usedConnections.add(conn);
-                            try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                                for (Object[] args : chunk) {
-                                    for (int j = 0; j < args.length; j++) {
-                                        if (args[j] == null) ps.setNull(j + 1, java.sql.Types.VARCHAR);
-                                        else ps.setObject(j + 1, args[j]);
-                                    }
-                                    ps.addBatch();
-                                }
-                                ps.executeBatch();
-                            } finally {
-                                connectionQueue.put(conn);
-                            }
-                            return null;
-                        }));
-                    }
-                }
-                for (Future<Void> future : futures) {
-                    future.get();
-                }
-            }
-            
-            // Parallel commit — only on connections that did actual work
-            long startCommit = System.currentTimeMillis();
-            List<Future<Void>> commitFutures = new ArrayList<>();
-            for (Connection conn : usedConnections) {
-                commitFutures.add(executor.submit(() -> { conn.commit(); return null; }));
-            }
-            for (Future<Void> f : commitFutures) {
-                f.get();
-            }
-            long endExec = System.currentTimeMillis();
-            log.info("Committed {}/{} connections in {} ms. Total execution time: {} ms.",
-                    usedConnections.size(), numConnections, (endExec - startCommit), (endExec - startExec));
-        } catch (Exception e) {
-            log.error("Error occurred during script execution. Rolling back all connections.", e);
-            for (Connection conn : conns) {
-                try { conn.rollback(); } catch (Exception ignored) {}
-            }
-            throw new RuntimeException("Script execution failed and all changes were rolled back.", e);
-        } finally {
-            executor.shutdown();
-            for (Connection conn : conns) {
-                try { conn.close(); } catch (Exception ignored) {}
-            }
-        }
-    }
 
-    private int getInsertLevel(String sql) {
-        String upper = sql.toUpperCase();
-        if (upper.contains("ASSECURITYGROUP")) {
-            return 0;
+        if (validScripts.isEmpty()) {
+            log.info("No valid scripts to execute.");
+            return;
         }
-        if (upper.contains("ASAUTHCOMPANYPAGEBUTTON")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHCOMPANYPAGE")) {
-            return 2;
-        }
-        if (upper.contains("ASAUTHCOMPANYINQUIRY")) {
-            return 2;
-        }
-        if (upper.contains("ASAUTHCOMPANYWEBSERVICE")) {
-            return 2;
-        }
-        if (upper.contains("ASAUTHCOMPANY")) {
-            return 1;
-        }
-        if (upper.contains("ASAUTHPLANPAGEBUTTON")) {
-            return 4;
-        }
-        if (upper.contains("ASAUTHPLANPAGE")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHTRANSACTIONBUTTON")) {
-            return 4;
-        }
-        if (upper.contains("ASAUTHTRANSACTION")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHPLANINQUIRY")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHPLAN")) {
-            return 2;
-        }
-        if (upper.contains("ASAUTHPRODUCTPAGEBUTTON")) {
-            return 4;
-        }
-        if (upper.contains("ASAUTHPRODUCTPAGE")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHPRODUCTTRANSACTIONBUTTON")) {
-            return 4;
-        }
-        if (upper.contains("ASAUTHPRODUCTTRANSACTION")) {
-            return 3;
-        }
-        if (upper.contains("ASAUTHPRODUCT")) {
-            return 2;
-        }
-        return 5;
-    }
 
-    private <T> List<List<T>> partition(List<T> list, int numParts) {
-        List<List<T>> partitions = new ArrayList<>();
-        if (list == null || list.isEmpty()) {
-            return partitions;
+        JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+
+        if (validScripts.size() == 1) {
+            String singleScript = validScripts.get(0);
+            log.info("Executing single SQL statement: {}", singleScript);
+            jdbc.execute(singleScript);
+        } else {
+            // Combine multiple statements into an anonymous PL/SQL block
+            StringBuilder sb = new StringBuilder();
+            sb.append("BEGIN\n");
+            for (String s : validScripts) {
+                sb.append("  ").append(s).append(";\n");
+            }
+            sb.append("END;");
+            
+            String plsql = sb.toString();
+            log.info("Executing {} SQL statements in a single anonymous PL/SQL block on secondaryDev database...", validScripts.size());
+            jdbc.execute(plsql);
         }
-        int size = list.size();
-        int chunkSize = (int) Math.ceil((double) size / numParts);
-        for (int i = 0; i < size; i += chunkSize) {
-            partitions.add(list.subList(i, Math.min(size, i + chunkSize)));
-        }
-        return partitions;
+        log.info("Successfully executed all {} SQL scripts.", scripts.size());
     }
 
     /** Escape single quotes for safe SQL string literals. */
