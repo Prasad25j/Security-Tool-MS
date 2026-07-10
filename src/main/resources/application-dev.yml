@@ -1,0 +1,19 @@
+server:
+  port: 8015
+
+pas:
+  service:
+    url: ${PAS_SERVICE_URL:http://10.10.3.236:8012}
+
+auth:
+  service:
+    url: ${AUTH_SERVICE_URL:http://10.10.3.237:9097}
+
+spring:
+  datasource:
+    secondary-dev:
+      jdbc-url: ${JDBC_URL:jdbc:oracle:thin:@//10.10.3.246:1521/OIPADEVDB}
+      username: ${DB_USER:OIPA_PAS}
+      password: ${DB_PASSWORD:OIPA_PAS}
+      driver-class-name: oracle.jdbc.OracleDriver
+      maximum-pool-size: 30

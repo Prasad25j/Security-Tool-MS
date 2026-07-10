@@ -10,9 +10,45 @@
 set -e
 
 # --- CONFIGURATION SECTION ---
-SERVER_IP="10.10.3.237"
-SERVER_USER="atumverse"
-SERVER_PORT="22"
+# Define target environment. Defaults to "dev".
+# Usage: ./deploy.sh [dev|uat|prod|custom_ip]
+TARGET_ENV=${1:-dev}
+
+if [ "$TARGET_ENV" == "dev" ]; then
+    SERVER_IP="10.10.3.237"
+    SERVER_USER="atumverse"
+    SERVER_PORT="22"
+    APP_PORT="8015"
+elif [ "$TARGET_ENV" == "uat" ]; then
+    SERVER_IP="10.10.3.197"
+    SERVER_USER="atumverse"
+    SERVER_PORT="22"
+    APP_PORT="8017"
+elif [ "$TARGET_ENV" == "prod" ]; then
+    SERVER_IP="10.20.9.21"
+    SERVER_USER="profinch"
+    SERVER_PORT="22"
+    APP_PORT="8015"
+else
+    # Assume the argument is a raw IP address
+    SERVER_IP="$TARGET_ENV"
+    SERVER_USER="atumverse"
+    SERVER_PORT="22"
+    # If the user passes UAT's IP, use 8017, otherwise default to 8015
+    if [ "$SERVER_IP" == "10.10.3.197" ]; then
+        APP_PORT="8017"
+    else
+        APP_PORT="8015"
+    fi
+fi
+
+# Determine active Spring profile based on target environment
+ACTIVE_PROFILE="dev"
+if [ "$TARGET_ENV" == "uat" ] || [ "$SERVER_IP" == "10.10.3.197" ]; then
+    ACTIVE_PROFILE="uat"
+elif [ "$TARGET_ENV" == "prod" ] || [ "$SERVER_IP" == "10.20.9.21" ]; then
+    ACTIVE_PROFILE="prod"
+fi
 
 # Local Path (using relative path since script is in the backend root)
 LOCAL_BACKEND_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -59,8 +95,20 @@ echo "======================================================================"
 echo "[Local] Navigating to backend directory: $LOCAL_BACKEND_DIR"
 cd "$LOCAL_BACKEND_DIR"
 
+# Update application.yml active profile before building
+echo "[Local] Setting active profile to '$ACTIVE_PROFILE' in application.yml..."
+cp src/main/resources/application.yml src/main/resources/application.yml.bak
+sed -E 's/(active:[[:space:]]*)[a-zA-Z0-9_-]+/\1'"$ACTIVE_PROFILE"'/' src/main/resources/application.yml.bak > src/main/resources/application.yml
+
 echo "[Local] Building backend jar (mvn clean package -DskipTests)..."
-mvn clean package -DskipTests
+if ! mvn clean package -DskipTests; then
+    echo "[-] Error: Maven build failed!" >&2
+    mv src/main/resources/application.yml.bak src/main/resources/application.yml
+    exit 1
+fi
+
+# Restore original application.yml
+mv src/main/resources/application.yml.bak src/main/resources/application.yml
 
 # Verify JAR file exists
 if [ ! -f "target/$JAR_NAME" ]; then
@@ -119,21 +167,21 @@ if ! ssh -p "$SERVER_PORT" "$SERVER_USER@$SERVER_IP" \
     exit 1
 fi
      
-# 5. Verify backend is running on port 8015
-echo "[Remote] Verifying backend is active and listening on port 8015..."
-if ! ssh -p "$SERVER_PORT" "$SERVER_USER@$SERVER_IP" '
+# 5. Verify backend is running on port $APP_PORT
+echo "[Remote] Verifying backend is active and listening on port $APP_PORT..."
+if ! ssh -p "$SERVER_PORT" "$SERVER_USER@$SERVER_IP" "
     success=false
     for i in {1..20}; do
-        if curl -s --connect-timeout 2 http://localhost:8015 >/dev/null || ss -tln | grep -q ":8015\b" || netstat -tln | grep -q ":8015 "; then
+        if curl -s --connect-timeout 2 http://localhost:$APP_PORT >/dev/null || ss -tln | grep -q \":$APP_PORT\\b\" || netstat -tln | grep -q \":$APP_PORT \"; then
             success=true
             break
         fi
-        echo "Waiting for backend to start (attempt $i/20)..."
+        echo \"Waiting for backend to start (attempt \$i/20)...\"
         sleep 3
     done
-    $success
-'; then
-    echo "[-] Error: Backend verification failed! Port 8015 is not responding."
+    \$success
+"; then
+    echo "[-] Error: Backend verification failed! Port $APP_PORT is not responding."
     echo "[-] Initiating rollback..."
     rollback_backend
     exit 1

@@ -19,6 +19,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.DefaultTransactionDefinition;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -31,7 +32,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 public class PasProxyController {
 
     private final HttpClient httpClient = HttpClient.newBuilder().build();
-    private final String pasServiceUrl = "http://10.10.3.236:8012";
+
+    @Value("${pas.service.url}")
+    private String pasServiceUrl;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Autowired
@@ -43,8 +46,8 @@ public class PasProxyController {
     private PlatformTransactionManager transactionManager;
 
     @RequestMapping(value = "/api/PASService/**", method = {
-        RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT, 
-        RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.OPTIONS
+            RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT,
+            RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.OPTIONS
     })
     public ResponseEntity<byte[]> proxyPas(
             @RequestBody(required = false) byte[] body,
@@ -67,11 +70,14 @@ public class PasProxyController {
                     try {
                         JsonNode rootNode = objectMapper.readTree(body);
                         JsonNode userNode = rootNode.path("user");
-                        if (!userNode.isMissingNode() && userNode.hasNonNull("password") && !userNode.path("password").asText().trim().isEmpty()) {
-                            // If a new password is provided, convert method to PUT and proxy to OIPA JAX-RS (which will hash the password)
+                        if (!userNode.isMissingNode() && userNode.hasNonNull("password")
+                                && !userNode.path("password").asText().trim().isEmpty()) {
+                            // If a new password is provided, convert method to PUT and proxy to OIPA JAX-RS
+                            // (which will hash the password)
                             method = "PUT";
                         } else {
-                            // No new password -> Update database directly to avoid OIPA's 405 error / password requirement
+                            // No new password -> Update database directly to avoid OIPA's 405 error /
+                            // password requirement
                             return handleDbUserUpdate(path, body);
                         }
                     } catch (Exception parseEx) {
@@ -95,12 +101,12 @@ public class PasProxyController {
                     .uri(uri)
                     .method(method, bodyPublisher);
 
-            // Copy headers (excluding restricted ones like Origin, Host, Connection, Content-Length, etc.)
+            // Copy headers (excluding restricted ones like Origin, Host, Connection,
+            // Content-Length, etc.)
             java.util.Set<String> restrictedHeaders = java.util.Set.of(
-                "origin", "host", "connection", "content-length", 
-                "date", "expect", "from", "upgrade", "via", "warning",
-                "keep-alive", "proxy-connection", "transfer-encoding"
-            );
+                    "origin", "host", "connection", "content-length",
+                    "date", "expect", "from", "upgrade", "via", "warning",
+                    "keep-alive", "proxy-connection", "transfer-encoding");
             Collections.list(request.getHeaderNames()).forEach(headerName -> {
                 String lowerName = headerName.toLowerCase();
                 if (!restrictedHeaders.contains(lowerName)) {
@@ -158,10 +164,9 @@ public class PasProxyController {
 
             // Fetch CLIENTGUID for the originalLoginName
             java.util.List<String> guids = jdbc.queryForList(
-                "SELECT CLIENTGUID FROM ASUSER WHERE CLIENTNUMBER = ?", 
-                new Object[]{originalLoginName}, 
-                String.class
-            );
+                    "SELECT CLIENTGUID FROM ASUSER WHERE CLIENTNUMBER = ?",
+                    new Object[] { originalLoginName },
+                    String.class);
 
             if (guids.isEmpty()) {
                 transactionManager.rollback(status);
@@ -173,10 +178,9 @@ public class PasProxyController {
             // Check if loginName has changed and if the new loginName already exists
             if (!originalLoginName.equalsIgnoreCase(newLoginName)) {
                 int count = jdbc.queryForObject(
-                    "SELECT COUNT(*) FROM ASUSER WHERE CLIENTNUMBER = ? AND CLIENTGUID != ?",
-                    new Object[]{newLoginName, clientGuid},
-                    Integer.class
-                );
+                        "SELECT COUNT(*) FROM ASUSER WHERE CLIENTNUMBER = ? AND CLIENTGUID != ?",
+                        new Object[] { newLoginName, clientGuid },
+                        Integer.class);
                 if (count > 0) {
                     transactionManager.rollback(status);
                     return ResponseEntity.status(HttpStatus.CONFLICT)
@@ -186,9 +190,8 @@ public class PasProxyController {
 
             // 2. Update ASUSER
             jdbc.update(
-                "UPDATE ASUSER SET CLIENTNUMBER = ?, LOCALECODE = ?, USERSTATUS = ? WHERE CLIENTGUID = ?",
-                newLoginName, localeCode, userStatus, clientGuid
-            );
+                    "UPDATE ASUSER SET CLIENTNUMBER = ?, LOCALECODE = ?, USERSTATUS = ? WHERE CLIENTGUID = ?",
+                    newLoginName, localeCode, userStatus, clientGuid);
 
             // 3. Update ASCLIENT details
             JsonNode clientNode = userNode.path("client");
@@ -212,9 +215,8 @@ public class PasProxyController {
                 }
 
                 jdbc.update(
-                    "UPDATE ASCLIENT SET FIRSTNAME = ?, LASTNAME = ?, SEX = ?, EMAIL = ?, COMPANYNAME = ?, UPDATEDGMT = SYSDATE WHERE CLIENTGUID = ?",
-                    firstName, lastName, sex, email, companyName, clientGuid
-                );
+                        "UPDATE ASCLIENT SET FIRSTNAME = ?, LASTNAME = ?, SEX = ?, EMAIL = ?, COMPANYNAME = ?, UPDATEDGMT = SYSDATE WHERE CLIENTGUID = ?",
+                        firstName, lastName, sex, email, companyName, clientGuid);
             }
 
             // 4. Synchronize security groups mapping
@@ -234,10 +236,9 @@ public class PasProxyController {
                     if (secGroupGuid == null || secGroupGuid.trim().isEmpty()) {
                         if (groupName != null && !groupName.trim().isEmpty()) {
                             java.util.List<String> foundGuids = jdbc.queryForList(
-                                "SELECT SECURITYGROUPGUID FROM ASSECURITYGROUP WHERE GROUPNAME = ?",
-                                new Object[]{groupName.trim()},
-                                String.class
-                            );
+                                    "SELECT SECURITYGROUPGUID FROM ASSECURITYGROUP WHERE GROUPNAME = ?",
+                                    new Object[] { groupName.trim() },
+                                    String.class);
                             if (!foundGuids.isEmpty()) {
                                 secGroupGuid = foundGuids.get(0);
                             }
@@ -288,9 +289,8 @@ public class PasProxyController {
                         }
 
                         jdbc.update(
-                            "INSERT INTO ASUSERSECURITYGROUP (SECURITYGROUPGUID, CLIENTGUID, ROLEEFFECTIVEFROM, ROLEEFFECTIVETO) VALUES (?, ?, ?, ?)",
-                            secGroupGuid, clientGuid, fromTime, toTime
-                        );
+                                "INSERT INTO ASUSERSECURITYGROUP (SECURITYGROUPGUID, CLIENTGUID, ROLEEFFECTIVEFROM, ROLEEFFECTIVETO) VALUES (?, ?, ?, ?)",
+                                secGroupGuid, clientGuid, fromTime, toTime);
                     }
                 }
             }
@@ -305,4 +305,3 @@ public class PasProxyController {
         }
     }
 }
-

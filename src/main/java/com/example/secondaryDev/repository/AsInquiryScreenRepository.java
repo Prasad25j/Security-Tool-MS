@@ -9,4 +9,5 @@ import com.example.entity.AsInquiryScreen;
 public interface AsInquiryScreenRepository extends JpaRepository<AsInquiryScreen, String> {
     List<AsInquiryScreen> findByCOMPANYGUID(String companyGuid);
     List<AsInquiryScreen> findByPLANGUID(String planGuid);
+    List<AsInquiryScreen> findByPRODUCTGUID(String productGuid);
 }

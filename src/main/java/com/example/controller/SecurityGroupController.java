@@ -5,6 +5,10 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.jdbc.core.JdbcTemplate;
+import java.util.Map;
+import java.util.Collections;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -86,8 +90,9 @@ public class SecurityGroupController {
     @GetMapping("/inquiry-screens")
     public ResponseEntity<List<InquiryScreenDto>> getInquiryScreens(
             @RequestParam(required = false) String companyGuid,
-            @RequestParam(required = false) String planGuid) {
-        List<InquiryScreenDto> screens = securityGroupService.getInquiryScreens(companyGuid, planGuid);
+            @RequestParam(required = false) String planGuid,
+            @RequestParam(required = false) String productGuid) {
+        List<InquiryScreenDto> screens = securityGroupService.getInquiryScreens(companyGuid, planGuid, productGuid);
         return ResponseEntity.ok(screens);
     }
 
@@ -120,6 +125,45 @@ public class SecurityGroupController {
             @PathVariable String companyGuid) {
         List<PlanDto> plans = securityGroupService.getPlansByCompany(companyGuid);
         return ResponseEntity.ok(plans);
+    }
+
+    @Autowired
+    @Qualifier("secondaryDevDataSource")
+    private javax.sql.DataSource dataSource;
+
+    private org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    @javax.annotation.PostConstruct
+    public void init() {
+        this.jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
+    }
+
+    @GetMapping("/debug-db")
+    public ResponseEntity<Object> debugDb(
+            @RequestParam(required = false) String planGuid,
+            @RequestParam(required = false) String productGuid,
+            @RequestParam(required = false) String txnGuid) {
+        try {
+            List<Map<String, Object>> rows;
+            if (planGuid != null) {
+                rows = jdbc.queryForList(
+                    "SELECT TRANSACTIONGUID, TRANSACTIONNAME, PRODUCTGUID, PLANGUID FROM ASTRANSACTION WHERE UPPER(PLANGUID) = UPPER(?)", planGuid);
+            } else if (productGuid != null) {
+                rows = jdbc.queryForList(
+                    "SELECT TRANSACTIONGUID, TRANSACTIONNAME, PRODUCTGUID, PLANGUID FROM ASTRANSACTION WHERE UPPER(PRODUCTGUID) = UPPER(?)", productGuid);
+            } else if (txnGuid != null) {
+                rows = jdbc.queryForList(
+                    "SELECT TRANSACTIONGUID, TRANSACTIONNAME, PRODUCTGUID, PLANGUID FROM ASTRANSACTION WHERE UPPER(TRANSACTIONGUID) = UPPER(?)", txnGuid);
+            } else {
+                rows = jdbc.queryForList(
+                    "SELECT COUNT(*) as cnt, COUNT(DISTINCT PLANGUID) as plans, COUNT(DISTINCT PRODUCTGUID) as prods FROM ASTRANSACTION");
+            }
+            return ResponseEntity.ok(rows);
+        } catch (Exception e) {
+            java.io.StringWriter sw = new java.io.StringWriter();
+            e.printStackTrace(new java.io.PrintWriter(sw));
+            return ResponseEntity.status(500).body(sw.toString());
+        }
     }
 
     /**

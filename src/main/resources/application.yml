@@ -1,17 +1,16 @@
+server:
+  tomcat:
+    max-http-form-post-size: 50MB
+
 spring:
+  profiles:
+    active: dev
   servlet:
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
   application:
     name: OIPASecurityTool
-  datasource:
-    secondary-dev:
-      jdbc-url: jdbc:oracle:thin:@//10.10.3.246:1521/OIPADEVDB
-      username: OIPA_PAS
-      password: OIPA_PAS
-      driver-class-name: oracle.jdbc.OracleDriver
-      maximum-pool-size: 30
   jpa:
     hibernate:
       ddl-auto: none
@@ -20,9 +19,6 @@ spring:
         dialect: org.hibernate.dialect.OracleDialect
         format_sql: true
     show-sql: true
-
-server:
-  port: 8015
 
 logging:
   level:

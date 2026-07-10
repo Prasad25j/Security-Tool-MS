@@ -13,6 +13,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestTemplate;
 
@@ -20,11 +21,13 @@ import org.springframework.web.client.RestTemplate;
 public class AuthProxyController {
 
     private final RestTemplate restTemplate = new RestTemplate();
-    private final String authServiceUrl = "http://10.10.3.237:9097";
+
+    @Value("${auth.service.url}")
+    private String authServiceUrl;
 
     @RequestMapping(value = "/api/ivs/**", method = {
-        RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT, 
-        RequestMethod.DELETE, RequestMethod.OPTIONS
+            RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT,
+            RequestMethod.DELETE, RequestMethod.OPTIONS
     })
     public ResponseEntity<byte[]> proxyAuth(
             @RequestBody(required = false) byte[] body,

@@ -76,6 +76,7 @@ public class SecurityGroupService {
     @Autowired private AsAuthTransactionButtonRepository transactionButtonRepo;
     @Autowired private AsAuthProductTransactionButtonRepository productTransactionButtonRepo;
     @Autowired private AsInquiryScreenRepository inquiryScreenRepo;
+    @Autowired private AsAuthProductInquiryRepository productInquiryRepo;
     @Autowired private AsProductSecondaryDevRepository productSecondaryDevRepo;
     @Autowired private AsTransactionSecondaryDevRepository transactionSecondaryDevRepo;
     @Autowired private AsPlanSecondaryDevRepository planSecondaryDevRepo;
@@ -129,22 +130,47 @@ public class SecurityGroupService {
     // ===================================================================
     // 0e. GET /api/inquiry-screens  —  list inquiry screens
     // ===================================================================
+    private Map<String, String> getInquiryTypeCodeToNameMap() {
+        Map<String, String> map = new java.util.HashMap<>();
+        map.put("01", "Main Menu");
+        map.put("02", "Policy Level");
+        map.put("03", "Client Level");
+        try {
+            JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+            jdbc.query("SELECT CODEVALUE, SHORTDESCRIPTION FROM ASCODE WHERE CODENAME = 'AsCodeInquiryScreenType'", rs -> {
+                String codeVal = rs.getString("CODEVALUE");
+                if (codeVal != null) {
+                    map.put(codeVal.trim(), rs.getString("SHORTDESCRIPTION"));
+                }
+            });
+        } catch (Exception e) {
+            log.warn("Failed to retrieve inquiry screen type codes from ASCODE, using defaults. Error: {}", e.getMessage());
+        }
+        return map;
+    }
+
     @Transactional(value = "secondaryDevTransactionManager", readOnly = true)
-    public List<InquiryScreenDto> getInquiryScreens(String companyGuid, String planGuid) {
+    public List<InquiryScreenDto> getInquiryScreens(String companyGuid, String planGuid, String productGuid) {
         List<AsInquiryScreen> screens;
         if (companyGuid != null && !companyGuid.trim().isEmpty()) {
             screens = inquiryScreenRepo.findByCOMPANYGUID(companyGuid);
         } else if (planGuid != null && !planGuid.trim().isEmpty()) {
             screens = inquiryScreenRepo.findByPLANGUID(planGuid);
+        } else if (productGuid != null && !productGuid.trim().isEmpty()) {
+            screens = inquiryScreenRepo.findByPRODUCTGUID(productGuid);
         } else {
             screens = inquiryScreenRepo.findAll();
         }
+        Map<String, String> typeMap = getInquiryTypeCodeToNameMap();
         return screens.stream()
-                .map(s -> new InquiryScreenDto(
-                        s.getINQUIRYSCREENNAMEGUID() != null && !s.getINQUIRYSCREENNAMEGUID().trim().isEmpty()
-                                ? s.getINQUIRYSCREENNAMEGUID()
-                                : s.getINQUIRYSCREENGUID(),
-                        s.getSCREENNAME()))
+                .map(s -> {
+                    String guid = s.getINQUIRYSCREENNAMEGUID() != null && !s.getINQUIRYSCREENNAMEGUID().trim().isEmpty()
+                            ? s.getINQUIRYSCREENNAMEGUID()
+                            : s.getINQUIRYSCREENGUID();
+                    String typeCode = s.getTYPECODE() != null ? s.getTYPECODE().trim() : null;
+                    String typeName = typeMap.getOrDefault(typeCode, "Unknown");
+                    return new InquiryScreenDto(guid, s.getSCREENNAME(), typeCode, typeName);
+                })
                 .collect(Collectors.toList());
     }
 
@@ -521,6 +547,24 @@ public class SecurityGroupService {
         List<AsAuthProductTransactionButtonRepository.Projection> productTransactionButtons = productTransactionButtonsRows.stream()
                 .map(m -> new ProductTransactionButtonProjection(new Row(m))).collect(Collectors.toList());
 
+        List<Map<String, Object>> productInquiriesRows = jdbc.queryForList(
+            "select /*+ LEADING(c ap i) USE_NL(ap i) */ i.AUTHPRODUCTINQUIRYGUID, i.AUTHPRODUCTGUID, i.INQUIRYSCREENNAMEGUID " +
+            "from ASAUTHPRODUCTINQUIRY i " +
+            "join ASAUTHPRODUCT ap on i.AUTHPRODUCTGUID = ap.AUTHPRODUCTGUID " +
+            "join ASAUTHCOMPANY c on ap.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "where c.SECURITYGROUPGUID = ?",
+            securityGroupGuid
+        );
+        class ProductInquiryProjection implements AsAuthProductInquiryRepository.Projection {
+            private final Row r;
+            ProductInquiryProjection(Row r) { this.r = r; }
+            public String getAUTHPRODUCTINQUIRYGUID() { return r.get("AUTHPRODUCTINQUIRYGUID"); }
+            public String getAUTHPRODUCTGUID() { return r.get("AUTHPRODUCTGUID"); }
+            public String getINQUIRYSCREENGUID() { return r.get("INQUIRYSCREENNAMEGUID"); }
+        }
+        List<AsAuthProductInquiryRepository.Projection> productInquiries = productInquiriesRows.stream()
+                .map(m -> new ProductInquiryProjection(new Row(m))).collect(Collectors.toList());
+
         // ── Pre-build lookup maps for parent/child mapping ────────────────
         Map<String, String> authCompanyToCompanyGuidMap = companies.stream()
                 .filter(ac -> ac.getAUTHCOMPANYGUID() != null && ac.getCOMPANYGUID() != null)
@@ -681,6 +725,10 @@ public class SecurityGroupService {
                 .filter(b -> b.getAUTHPRODUCTTRANSACTIONGUID() != null)
                 .collect(Collectors.groupingBy(AsAuthProductTransactionButtonRepository.Projection::getAUTHPRODUCTTRANSACTIONGUID));
 
+        Map<String, List<AsAuthProductInquiryRepository.Projection>> productInquiriesMap = productInquiries.stream()
+                .filter(pi -> authProductToCompanyGuidMap.get(pi.getAUTHPRODUCTGUID()) != null && authProductToProductGuidMap.get(pi.getAUTHPRODUCTGUID()) != null)
+                .collect(Collectors.groupingBy(pi -> authProductToCompanyGuidMap.get(pi.getAUTHPRODUCTGUID()) + "|" + authProductToProductGuidMap.get(pi.getAUTHPRODUCTGUID())));
+
         // ── Assemble nested structure per company ───────────────────────
         List<CompanyAuthDto> companyDtos = new ArrayList<>();
         for (AsAuthCompany ac : companies) {
@@ -804,11 +852,191 @@ public class SecurityGroupService {
                 }
                 prodDto.setProductTransactions(prTxnDtos);
 
+                // Product Inquiries
+                List<AsAuthProductInquiryRepository.Projection> prInquiries = productInquiriesMap.getOrDefault(productKey, Collections.emptyList());
+                prodDto.setProductInquiries(
+                    prInquiries.stream()
+                        .map(pi -> new InquiryDto(pi.getINQUIRYSCREENGUID()))
+                        .collect(Collectors.toList())
+                );
+
                 productDtos.add(prodDto);
             }
             cDto.setProducts(productDtos);
 
             companyDtos.add(cDto);
+        }
+
+        // ── Populate authGuidMap for O(1) in-memory lookup during saving ──
+        Map<String, String> authGuidMap = dto.getAuthGuidMap();
+        
+        // 1. Companies
+        for (AsAuthCompany ac : companies) {
+            String cGuid = ac.getCOMPANYGUID();
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid), ac.getAUTHCOMPANYGUID().trim());
+            }
+        }
+        
+        // 2. Company Pages
+        for (AsAuthCompanyPageRepository.Projection p : companyPages) {
+            String cGuid = authCompanyToCompanyGuidMap.get(p.getAUTHCOMPANYGUID());
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(p.getAUTHPAGEGUID()), p.getAUTHCOMPANYPAGEGUID());
+            }
+        }
+        
+        
+        // 4. Plans
+        for (AsAuthPlanRepository.Projection plan : plans) {
+            String cGuid = authCompanyToCompanyGuidMap.get(plan.getAUTHCOMPANYGUID());
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(plan.getPLANGUID()), plan.getAUTHPLANGUID());
+            }
+        }
+
+        // 5. Plan Pages
+        for (AsAuthPlanPageRepository.Projection pp : planPages) {
+            String cGuid = authPlanToCompanyGuidMap.get(pp.getAUTHPLANGUID());
+            String planGuid = authPlanToPlanGuidMap.get(pp.getAUTHPLANGUID());
+            if (cGuid != null && planGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(planGuid) + "|" + norm(pp.getAUTHPAGEGUID()), pp.getAUTHPLANPAGEGUID());
+            }
+        }
+
+        // 6. Plan Page Buttons
+        Map<String, String> pageGuidByAuthPlanPageGuid = planPages.stream()
+            .collect(Collectors.toMap(
+                AsAuthPlanPageRepository.Projection::getAUTHPLANPAGEGUID,
+                AsAuthPlanPageRepository.Projection::getAUTHPAGEGUID,
+                (v1, v2) -> v1
+            ));
+        for (AsAuthPlanPageButtonRepository.Projection pb : planPageButtons) {
+            String cGuid = planPageToCompanyGuidMap.get(pb.getAUTHPLANPAGEGUID());
+            String planGuid = planPageToPlanGuidMap.get(pb.getAUTHPLANPAGEGUID());
+            String pGuid = pageGuidByAuthPlanPageGuid.get(pb.getAUTHPLANPAGEGUID());
+            if (cGuid != null && planGuid != null && pGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(planGuid) + "|" + norm(pGuid) + "|" + norm(pb.getAUTHBUTTONGUID()), pb.getAUTHPLANPAGEGUID());
+            }
+        }
+
+        // 7. Transactions
+        for (AsAuthTransactionRepository.Projection t : transactions) {
+            String cGuid = authPlanToCompanyGuidMap.get(t.getAUTHPLANGUID());
+            String planGuid = authPlanToPlanGuidMap.get(t.getAUTHPLANGUID());
+            if (cGuid != null && planGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(planGuid) + "|" + norm(t.getTRANSACTIONGUID()), t.getAUTHTRANSACTIONGUID());
+            }
+        }
+
+        // 8. Transaction Buttons
+        Map<String, String> txnGuidByAuthTxnGuid = transactions.stream()
+            .collect(Collectors.toMap(
+                AsAuthTransactionRepository.Projection::getAUTHTRANSACTIONGUID,
+                AsAuthTransactionRepository.Projection::getTRANSACTIONGUID,
+                (v1, v2) -> v1
+            ));
+        for (AsAuthTransactionButtonRepository.Projection tb : transactionButtons) {
+            String authTxnGuid = tb.getAUTHTRANSACTIONGUID();
+            String txnGuid = txnGuidByAuthTxnGuid.get(authTxnGuid);
+            String cGuid = authTransactionToCompanyGuidMap.get(authTxnGuid);
+            String planGuid = authTransactionToPlanGuidMap.get(authTxnGuid);
+            if (cGuid != null && planGuid != null && txnGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(planGuid) + "|" + norm(txnGuid) + "|" + norm(tb.getAUTHBUTTONGUID()), authTxnGuid);
+            }
+        }
+
+        // 9. Products
+        for (AsAuthProductRepository.Projection prod : products) {
+            String cGuid = authCompanyToCompanyGuidMap.get(prod.getAUTHCOMPANYGUID());
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prod.getPRODUCTGUID()), prod.getAUTHPRODUCTGUID());
+            }
+        }
+
+        // 10. Product Pages
+        for (AsAuthProductPageRepository.Projection pp : productPages) {
+            String cGuid = authProductToCompanyGuidMap.get(pp.getAUTHPRODUCTGUID());
+            String prodGuid = authProductToProductGuidMap.get(pp.getAUTHPRODUCTGUID());
+            if (cGuid != null && prodGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prodGuid) + "|" + norm(pp.getAUTHPAGEGUID()), pp.getAUTHPRODUCTPAGEGUID());
+            }
+        }
+
+        // 11. Product Page Buttons
+        Map<String, String> pageGuidByAuthProdPageGuid = productPages.stream()
+            .collect(Collectors.toMap(
+                AsAuthProductPageRepository.Projection::getAUTHPRODUCTPAGEGUID,
+                AsAuthProductPageRepository.Projection::getAUTHPAGEGUID,
+                (v1, v2) -> v1
+            ));
+        for (AsAuthProductPageButtonRepository.Projection pb : productPageButtons) {
+            String cGuid = productPageToCompanyGuidMap.get(pb.getAUTHPRODUCTPAGEGUID());
+            String prodGuid = productPageToProductGuidMap.get(pb.getAUTHPRODUCTPAGEGUID());
+            String pGuid = pageGuidByAuthProdPageGuid.get(pb.getAUTHPRODUCTPAGEGUID());
+            if (cGuid != null && prodGuid != null && pGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prodGuid) + "|" + norm(pGuid) + "|" + norm(pb.getAUTHBUTTONGUID()), pb.getAUTHPRODUCTPAGEGUID());
+            }
+        }
+
+        // 12. Product Transactions
+        for (AsAuthProductTransactionRepository.Projection t : productTransactions) {
+            String cGuid = authProductToCompanyGuidMap.get(t.getAUTHPRODUCTGUID());
+            String prodGuid = authProductToProductGuidMap.get(t.getAUTHPRODUCTGUID());
+            if (cGuid != null && prodGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prodGuid) + "|" + norm(t.getTRANSACTIONGUID()), t.getAUTHPRODUCTTRANSACTIONGUID());
+            }
+        }
+
+        // 13. Product Transaction Buttons
+        Map<String, String> txnGuidByAuthProdTxnGuid = productTransactions.stream()
+            .collect(Collectors.toMap(
+                AsAuthProductTransactionRepository.Projection::getAUTHPRODUCTTRANSACTIONGUID,
+                AsAuthProductTransactionRepository.Projection::getTRANSACTIONGUID,
+                (v1, v2) -> v1
+            ));
+        for (AsAuthProductTransactionButtonRepository.Projection tb : productTransactionButtons) {
+            String authTxnGuid = tb.getAUTHPRODUCTTRANSACTIONGUID();
+            String txnGuid = txnGuidByAuthProdTxnGuid.get(authTxnGuid);
+            String cGuid = productTransactionToCompanyGuidMap.get(authTxnGuid);
+            String prodGuid = productTransactionToProductGuidMap.get(authTxnGuid);
+            if (cGuid != null && prodGuid != null && txnGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prodGuid) + "|" + norm(txnGuid) + "|" + norm(tb.getAUTHBUTTONGUID()), authTxnGuid);
+            }
+        }
+
+        // 14. Company Inquiries
+        for (AsAuthCompanyInquiryRepository.Projection i : companyInquiries) {
+            String cGuid = authCompanyToCompanyGuidMap.get(i.getAUTHCOMPANYGUID());
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(i.getINQUIRYSCREENGUID()), i.getAUTHCOMPANYINQUIRYGUID());
+            }
+        }
+
+        // 15. Company Web Services
+        for (AsAuthCompanyWebServiceRepository.Projection w : companyWebServices) {
+            String cGuid = authCompanyToCompanyGuidMap.get(w.getAUTHCOMPANYGUID());
+            if (cGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(w.getAUTHWEBSERVICEGUID()), w.getAUTHWEBSERVICEGUID());
+            }
+        }
+
+        // 16. Plan Inquiries
+        for (AsAuthPlanInquiryRepository.Projection pi : planInquiries) {
+            String cGuid = authPlanToCompanyGuidMap.get(pi.getAUTHPLANGUID());
+            String planGuid = authPlanToPlanGuidMap.get(pi.getAUTHPLANGUID());
+            if (cGuid != null && planGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(planGuid) + "|" + norm(pi.getINQUIRYSCREENGUID()), pi.getAUTHPLANINQUIRYGUID());
+            }
+        }
+
+        // 17. Product Inquiries
+        for (AsAuthProductInquiryRepository.Projection pi : productInquiries) {
+            String cGuid = authProductToCompanyGuidMap.get(pi.getAUTHPRODUCTGUID());
+            String prodGuid = authProductToProductGuidMap.get(pi.getAUTHPRODUCTGUID());
+            if (cGuid != null && prodGuid != null) {
+                authGuidMap.put(norm(securityGroupGuid) + "|" + norm(cGuid) + "|" + norm(prodGuid) + "|" + norm(pi.getINQUIRYSCREENGUID()), pi.getAUTHPRODUCTINQUIRYGUID());
+            }
         }
 
         dto.setCompanies(companyDtos);
@@ -842,7 +1070,7 @@ public class SecurityGroupService {
         List<String> scripts = new ArrayList<>();
         Map<String, String> authGuidMap = new java.util.HashMap<>();
         if (!isNewGroup) {
-            loadExistingAuthGuids(guid, authGuidMap);
+            authGuidMap.putAll(existing.getAuthGuidMap());
         }
 
         // ── Security Group INSERT if new ────────────────────────────────
@@ -898,6 +1126,9 @@ public class SecurityGroupService {
         Set<String> existingProductTransactionButtonKeys = flattenProductTransactionButtonKeys(existing);
         Set<String> incomingProductTransactionButtonKeys = flattenProductTransactionButtonKeys(incoming);
 
+        Set<String> existingProductInquiryKeys = flattenProductInquiryKeys(existing);
+        Set<String> incomingProductInquiryKeys = flattenProductInquiryKeys(incoming);
+
         Set<String> existingTransactionButtonKeys = flattenTransactionButtonKeys(existing);
         Set<String> incomingTransactionButtonKeys = flattenTransactionButtonKeys(incoming);
 
@@ -907,117 +1138,260 @@ public class SecurityGroupService {
         // Product transaction buttons
         diff(existingProductTransactionButtonKeys, incomingProductTransactionButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPRODUCTTRANSACTIONBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPRODUCTTRANSACTIONGUID IN (SELECT AUTHPRODUCTTRANSACTIONGUID FROM ASAUTHPRODUCTTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            if (parentAuthGuid != null && !parentAuthGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTTRANSACTIONBUTTON WHERE AUTHPRODUCTTRANSACTIONGUID = '%s' AND AUTHBUTTONGUID = '%s';",
+                    esc(parentAuthGuid.trim()), esc(p[4])));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTTRANSACTIONBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPRODUCTTRANSACTIONGUID IN (SELECT AUTHPRODUCTTRANSACTIONGUID FROM ASAUTHPRODUCTTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
+                    esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Plan transaction buttons
         diff(existingTransactionButtonKeys, incomingTransactionButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHTRANSACTIONBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHTRANSACTIONGUID IN (SELECT AUTHTRANSACTIONGUID FROM ASAUTHTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            if (parentAuthGuid != null && !parentAuthGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHTRANSACTIONBUTTON WHERE AUTHTRANSACTIONGUID = '%s' AND AUTHBUTTONGUID = '%s';",
+                    esc(parentAuthGuid.trim()), esc(p[4])));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHTRANSACTIONBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHTRANSACTIONGUID IN (SELECT AUTHTRANSACTIONGUID FROM ASAUTHTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
+                    esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         
         // Product page buttons
         diff(existingProductPageButtonKeys, incomingProductPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPRODUCTPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPRODUCTPAGEGUID IN (SELECT AUTHPRODUCTPAGEGUID FROM ASAUTHPRODUCTPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            if (parentAuthGuid != null && !parentAuthGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTPAGEBUTTON WHERE AUTHPRODUCTPAGEGUID = '%s' AND AUTHBUTTONGUID = '%s';",
+                    esc(parentAuthGuid.trim()), esc(p[4])));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPRODUCTPAGEGUID IN (SELECT AUTHPRODUCTPAGEGUID FROM ASAUTHPRODUCTPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
+                    esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Product pages
         diff(existingProductPageKeys, incomingProductPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPRODUCTPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTPAGE WHERE AUTHPRODUCTPAGEGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Product transactions
         diff(existingProductTransactionKeys, incomingProductTransactionKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPRODUCTTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTTRANSACTION WHERE AUTHPRODUCTTRANSACTIONGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
+        });
+        // Product inquiries
+        diff(existingProductInquiryKeys, incomingProductInquiryKeys).forEach(k -> {
+            String[] p = k.split("\\|");
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTINQUIRY WHERE AUTHPRODUCTINQUIRYGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCTINQUIRY WHERE INQUIRYSCREENNAMEGUID = '%s' AND AUTHPRODUCTGUID IN (SELECT AUTHPRODUCTGUID FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Products
         diff(existingProductKeys, incomingProductKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCT WHERE AUTHPRODUCTGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPRODUCT WHERE PRODUCTGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
+                    esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
 
         // Plan page buttons
         diff(existingPlanPageButtonKeys, incomingPlanPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPLANPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPLANPAGEGUID IN (SELECT AUTHPLANPAGEGUID FROM ASAUTHPLANPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
-                esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            if (parentAuthGuid != null && !parentAuthGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANPAGEBUTTON WHERE AUTHPLANPAGEGUID = '%s' AND AUTHBUTTONGUID = '%s';",
+                    esc(parentAuthGuid.trim()), esc(p[4])));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHPLANPAGEGUID IN (SELECT AUTHPLANPAGEGUID FROM ASAUTHPLANPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s')));",
+                    esc(p[4]), esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Plan pages
         diff(existingPlanPageKeys, incomingPlanPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPLANPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANPAGE WHERE AUTHPLANPAGEGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Plan transactions
         diff(existingTransactionKeys, incomingTransactionKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHTRANSACTION WHERE AUTHTRANSACTIONGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHTRANSACTION WHERE TRANSACTIONGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Plan inquiries
         diff(existingPlanInquiryKeys, incomingPlanInquiryKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPLANINQUIRY WHERE INQUIRYSCREENNAMEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2] + "|" + p[3];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANINQUIRY WHERE AUTHPLANINQUIRYGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLANINQUIRY WHERE INQUIRYSCREENNAMEGUID = '%s' AND AUTHPLANGUID IN (SELECT AUTHPLANGUID FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Plans
         diff(existingPlanKeys, incomingPlanKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLAN WHERE AUTHPLANGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHPLAN WHERE PLANGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
+                    esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
 
         // Company page buttons
         diff(existingCompanyPageButtonKeys, incomingCompanyPageButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHCOMPANYPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHCOMPANYPAGEGUID IN (SELECT AUTHCOMPANYPAGEGUID FROM ASAUTHCOMPANYPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
-                esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            if (parentAuthGuid != null && !parentAuthGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYPAGEBUTTON WHERE AUTHCOMPANYPAGEGUID = '%s' AND AUTHBUTTONGUID = '%s';",
+                    esc(parentAuthGuid.trim()), esc(p[3])));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYPAGEBUTTON WHERE AUTHBUTTONGUID = '%s' AND AUTHCOMPANYPAGEGUID IN (SELECT AUTHCOMPANYPAGEGUID FROM ASAUTHCOMPANYPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s'));",
+                    esc(p[3]), esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Company pages
         diff(existingCompanyPageKeys, incomingCompanyPageKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHCOMPANYPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYPAGE WHERE AUTHCOMPANYPAGEGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYPAGE WHERE AUTHPAGEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
+                    esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Company inquiries
         diff(existingCompanyInquiryKeys, incomingCompanyInquiryKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHCOMPANYINQUIRY WHERE INQUIRYSCREENNAMEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYINQUIRY WHERE AUTHCOMPANYINQUIRYGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYINQUIRY WHERE INQUIRYSCREENNAMEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
+                    esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Company web services
         diff(existingCompanyWebServiceKeys, incomingCompanyWebServiceKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHCOMPANYWEBSERVICE WHERE AUTHWEBSERVICEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
-                esc(p[2]), esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1] + "|" + p[2];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYWEBSERVICE WHERE AUTHWEBSERVICEGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANYWEBSERVICE WHERE AUTHWEBSERVICEGUID = '%s' AND AUTHCOMPANYGUID IN (SELECT AUTHCOMPANYGUID FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s');",
+                    esc(p[2]), esc(p[1]), esc(p[0])));
+            }
         });
         // Companies
         diff(existingCompanyKeys, incomingCompanyKeys).forEach(k -> {
             String[] p = k.split("\\|");
-            scripts.add(String.format(
-                "DELETE FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
-                esc(p[1]), esc(p[0])));
+            String key = p[0] + "|" + p[1];
+            String authGuid = authGuidMap.get(key);
+            if (authGuid != null && !authGuid.trim().isEmpty()) {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANY WHERE AUTHCOMPANYGUID = '%s';",
+                    esc(authGuid.trim())));
+            } else {
+                scripts.add(String.format(
+                    "DELETE FROM ASAUTHCOMPANY WHERE COMPANYGUID = '%s' AND SECURITYGROUPGUID = '%s';",
+                    esc(p[1]), esc(p[0])));
+            }
         });
 
         // Orphaned group cleanup
@@ -1181,6 +1555,16 @@ public class SecurityGroupService {
                 "INSERT INTO ASAUTHPRODUCTTRANSACTIONBUTTON (AUTHPRODUCTTRANSACTIONGUID, AUTHBUTTONGUID) VALUES ('%s', '%s');",
                 esc(parentAuthGuid), esc(p[4])));
         });
+        // Product inquiries
+        diff(incomingProductInquiryKeys, existingProductInquiryKeys).forEach(k -> {
+            String[] p = k.split("\\|");
+            String newGuid = java.util.UUID.randomUUID().toString().toUpperCase();
+            String parentKey = p[0] + "|" + p[1] + "|" + p[2];
+            String parentAuthGuid = authGuidMap.get(parentKey);
+            scripts.add(String.format(
+                "INSERT INTO ASAUTHPRODUCTINQUIRY (AUTHPRODUCTINQUIRYGUID, AUTHPRODUCTGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                esc(newGuid), esc(parentAuthGuid), esc(p[3])));
+        });
         // Plan transaction buttons
         diff(incomingTransactionButtonKeys, existingTransactionButtonKeys).forEach(k -> {
             String[] p = k.split("\\|");
@@ -1205,7 +1589,8 @@ public class SecurityGroupService {
         List<MigrationScriptDto> migrationScripts = new ArrayList<>();
         Map<String, String> authGuidMap = new java.util.HashMap<>();
         if (guid != null && !guid.trim().isEmpty()) {
-            loadExistingAuthGuids(guid, authGuidMap);
+            SecurityGroupDto existing = getSecurityConfiguration(guid);
+            authGuidMap.putAll(existing.getAuthGuidMap());
         }
 
         // Helper to safely get or generate a GUID for a composite key
@@ -1445,6 +1830,21 @@ public class SecurityGroupService {
                                 }
                             }
                         }
+
+                        // Product Inquiries
+                        if (product.getProductInquiries() != null) {
+                            for (InquiryDto inquiry : product.getProductInquiries()) {
+                                String inqGuid = inquiry.getInquiryScreenNameGuid();
+                                String piKey = prodKey + "|" + inqGuid;
+                                String authPiGuid = getOrGen.apply(piKey);
+
+                                String inqScript = String.format(
+                                    "INSERT INTO ASAUTHPRODUCTINQUIRY (AUTHPRODUCTINQUIRYGUID, AUTHPRODUCTGUID, INQUIRYSCREENNAMEGUID) VALUES ('%s', '%s', '%s');",
+                                    esc(authPiGuid), esc(authProdGuid), esc(inqGuid));
+                                scripts.add(inqScript);
+                                migrationScripts.add(new MigrationScriptDto(companyGuid, productGuid, null, "PRODUCT_INQUIRY", inqGuid, inqScript));
+                            }
+                        }
                     }
                 }
             }
@@ -1619,6 +2019,22 @@ public class SecurityGroupService {
             },
             securityGroupGuid
         );
+
+        // 12. Product Inquiries
+        jdbc.query(
+            "SELECT pi.AUTHPRODUCTINQUIRYGUID, c.COMPANYGUID, pr.PRODUCTGUID, pi.INQUIRYSCREENNAMEGUID " +
+            "FROM ASAUTHPRODUCTINQUIRY pi " +
+            "JOIN ASAUTHPRODUCT pr ON pi.AUTHPRODUCTGUID = pr.AUTHPRODUCTGUID " +
+            "JOIN ASAUTHCOMPANY c ON pr.AUTHCOMPANYGUID = c.AUTHCOMPANYGUID " +
+            "WHERE c.SECURITYGROUPGUID = ?",
+            rs -> {
+                String comp = rs.getString("COMPANYGUID");
+                String prod = rs.getString("PRODUCTGUID");
+                String inq = rs.getString("INQUIRYSCREENNAMEGUID");
+                authGuidMap.put(securityGroupGuid + "|" + (comp != null ? comp.trim() : "") + "|" + (prod != null ? prod.trim() : "") + "|" + (inq != null ? inq.trim() : ""), rs.getString("AUTHPRODUCTINQUIRYGUID"));
+            },
+            securityGroupGuid
+        );
     }
 
     // ===================================================================
@@ -1627,30 +2043,30 @@ public class SecurityGroupService {
     // ===================================================================
 
     private Set<String> flattenCompanyKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         return dto.getCompanies().stream()
-                .map(c -> g + "|" + c.getCompanyGuid())
+                .map(c -> g + "|" + norm(c.getCompanyGuid()))
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     private Set<String> flattenCompanyPageKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PageDto p : c.getCompanyPages()) {
-                keys.add(g + "|" + c.getCompanyGuid() + "|" + p.getPageGuid());
+                keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(p.getPageGuid()));
             }
         }
         return keys;
     }
 
     private Set<String> flattenCompanyPageButtonKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PageDto p : c.getCompanyPages()) {
                 for (ButtonDto b : p.getButtons()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + p.getPageGuid() + "|" + b.getButtonGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(p.getPageGuid()) + "|" + norm(b.getButtonGuid()));
                 }
             }
         }
@@ -1658,45 +2074,45 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenCompanyInquiryKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (InquiryDto i : c.getCompanyInquiries()) {
-                keys.add(g + "|" + c.getCompanyGuid() + "|" + i.getInquiryScreenNameGuid());
+                keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(i.getInquiryScreenNameGuid()));
             }
         }
         return keys;
     }
 
     private Set<String> flattenCompanyWebServiceKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (WebServiceDto w : c.getCompanyWebServices()) {
-                keys.add(g + "|" + c.getCompanyGuid() + "|" + w.getWebServiceGuid());
+                keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(w.getWebServiceGuid()));
             }
         }
         return keys;
     }
 
     private Set<String> flattenPlanKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto p : c.getPlans()) {
-                keys.add(g + "|" + c.getCompanyGuid() + "|" + p.getPlanGuid());
+                keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(p.getPlanGuid()));
             }
         }
         return keys;
     }
 
     private Set<String> flattenPlanPageKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto plan : c.getPlans()) {
                 for (PageDto pg : plan.getPlanPages()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + plan.getPlanGuid() + "|" + pg.getPageGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(plan.getPlanGuid()) + "|" + norm(pg.getPageGuid()));
                 }
             }
         }
@@ -1704,13 +2120,13 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenPlanPageButtonKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto plan : c.getPlans()) {
                 for (PageDto pg : plan.getPlanPages()) {
                     for (ButtonDto b : pg.getButtons()) {
-                        keys.add(g + "|" + c.getCompanyGuid() + "|" + plan.getPlanGuid() + "|" + pg.getPageGuid() + "|" + b.getButtonGuid());
+                        keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(plan.getPlanGuid()) + "|" + norm(pg.getPageGuid()) + "|" + norm(b.getButtonGuid()));
                     }
                 }
             }
@@ -1719,12 +2135,12 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenTransactionKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto plan : c.getPlans()) {
                 for (TransactionDto t : plan.getPlanTransactions()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + plan.getPlanGuid() + "|" + t.getTransactionGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(plan.getPlanGuid()) + "|" + norm(t.getTransactionGuid()));
                 }
             }
         }
@@ -1732,12 +2148,12 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenPlanInquiryKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto plan : c.getPlans()) {
                 for (InquiryDto i : plan.getPlanInquiries()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + plan.getPlanGuid() + "|" + i.getInquiryScreenNameGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(plan.getPlanGuid()) + "|" + norm(i.getInquiryScreenNameGuid()));
                 }
             }
         }
@@ -1745,23 +2161,23 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenProductKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (ProductAuthDto pr : c.getProducts()) {
-                keys.add(g + "|" + c.getCompanyGuid() + "|" + pr.getProductGuid());
+                keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()));
             }
         }
         return keys;
     }
 
     private Set<String> flattenProductPageKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (ProductAuthDto pr : c.getProducts()) {
                 for (PageDto pg : pr.getProductPages()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + pr.getProductGuid() + "|" + pg.getPageGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()) + "|" + norm(pg.getPageGuid()));
                 }
             }
         }
@@ -1769,13 +2185,13 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenProductPageButtonKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (ProductAuthDto pr : c.getProducts()) {
                 for (PageDto pg : pr.getProductPages()) {
                     for (ButtonDto b : pg.getButtons()) {
-                        keys.add(g + "|" + c.getCompanyGuid() + "|" + pr.getProductGuid() + "|" + pg.getPageGuid() + "|" + b.getButtonGuid());
+                        keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()) + "|" + norm(pg.getPageGuid()) + "|" + norm(b.getButtonGuid()));
                     }
                 }
             }
@@ -1784,12 +2200,12 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenProductTransactionKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (ProductAuthDto pr : c.getProducts()) {
                 for (TransactionDto t : pr.getProductTransactions()) {
-                    keys.add(g + "|" + c.getCompanyGuid() + "|" + pr.getProductGuid() + "|" + t.getTransactionGuid());
+                    keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()) + "|" + norm(t.getTransactionGuid()));
                 }
             }
         }
@@ -1797,13 +2213,13 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenProductTransactionButtonKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (ProductAuthDto pr : c.getProducts()) {
                 for (TransactionDto t : pr.getProductTransactions()) {
                     for (ButtonDto b : t.getButtons()) {
-                        keys.add(g + "|" + c.getCompanyGuid() + "|" + pr.getProductGuid() + "|" + t.getTransactionGuid() + "|" + b.getButtonGuid());
+                        keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()) + "|" + norm(t.getTransactionGuid()) + "|" + norm(b.getButtonGuid()));
                     }
                 }
             }
@@ -1812,13 +2228,28 @@ public class SecurityGroupService {
     }
 
     private Set<String> flattenTransactionButtonKeys(SecurityGroupDto dto) {
-        String g = dto.getSecurityGroupGuid();
+        String g = norm(dto.getSecurityGroupGuid());
         Set<String> keys = new LinkedHashSet<>();
         for (CompanyAuthDto c : dto.getCompanies()) {
             for (PlanAuthDto plan : c.getPlans()) {
                 for (TransactionDto t : plan.getPlanTransactions()) {
                     for (ButtonDto b : t.getButtons()) {
-                        keys.add(g + "|" + c.getCompanyGuid() + "|" + plan.getPlanGuid() + "|" + t.getTransactionGuid() + "|" + b.getButtonGuid());
+                        keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(plan.getPlanGuid()) + "|" + norm(t.getTransactionGuid()) + "|" + norm(b.getButtonGuid()));
+                    }
+                }
+            }
+        }
+        return keys;
+    }
+
+    private Set<String> flattenProductInquiryKeys(SecurityGroupDto dto) {
+        String g = norm(dto.getSecurityGroupGuid());
+        Set<String> keys = new LinkedHashSet<>();
+        for (CompanyAuthDto c : dto.getCompanies()) {
+            for (ProductAuthDto pr : c.getProducts()) {
+                if (pr.getProductInquiries() != null) {
+                    for (InquiryDto i : pr.getProductInquiries()) {
+                        keys.add(g + "|" + norm(c.getCompanyGuid()) + "|" + norm(pr.getProductGuid()) + "|" + norm(i.getInquiryScreenNameGuid()));
                     }
                 }
             }
@@ -1827,6 +2258,15 @@ public class SecurityGroupService {
     }
 
     // ── Utility ─────────────────────────────────────────────────────────
+
+    /**
+     * Normalizes a GUID to uppercase so that case differences between
+     * lookup tables (e.g. ASPRODUCT.PRODUCTGUID) and auth tables
+     * (e.g. ASAUTHPRODUCT.PRODUCTGUID) never cause false diff results.
+     */
+    private String norm(String guid) {
+        return guid == null ? "" : guid.trim().toUpperCase();
+    }
 
     /**
      * Helper to batch collection queries in maximum chunks of 1000 to prevent Oracle ORA-01795 error.
@@ -1912,6 +2352,7 @@ public class SecurityGroupService {
         log.info("Fetching IT ADMIN GUIDs from database...");
         Set<String> guids = new java.util.HashSet<>();
         JdbcTemplate jdbc = new JdbcTemplate(secondaryDevDataSource);
+        jdbc.setFetchSize(10000);
         
         // Get IT ADMIN Security Group GUID
         List<String> groupGuids = jdbc.query(
