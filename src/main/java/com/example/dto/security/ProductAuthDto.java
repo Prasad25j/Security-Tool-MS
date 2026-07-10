@@ -11,6 +11,7 @@ public class ProductAuthDto {
     public void setSelected(Boolean selected) { this.selected = selected; }
     private List<PageDto> productPages = new ArrayList<>();
     private List<TransactionDto> productTransactions = new ArrayList<>();
+    private List<InquiryDto> productInquiries = new ArrayList<>();
 
     public ProductAuthDto() {}
 
@@ -24,4 +25,6 @@ public class ProductAuthDto {
     public void setProductPages(List<PageDto> productPages) { this.productPages = productPages; }
     public List<TransactionDto> getProductTransactions() { return productTransactions; }
     public void setProductTransactions(List<TransactionDto> productTransactions) { this.productTransactions = productTransactions; }
+    public List<InquiryDto> getProductInquiries() { return productInquiries; }
+    public void setProductInquiries(List<InquiryDto> productInquiries) { this.productInquiries = productInquiries; }
 }
